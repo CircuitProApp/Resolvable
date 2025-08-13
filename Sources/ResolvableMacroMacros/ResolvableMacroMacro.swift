@@ -3,11 +3,12 @@ import SwiftSyntax
 import SwiftSyntaxBuilder
 import SwiftSyntaxMacros
 
-public struct ResolvableMacro: PeerMacro, ExtensionMacro {
+public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
 
+    // Inject nested members: Definition, Instance, Override, Source, Resolved, Resolver
     public static func expansion(
         of node: AttributeSyntax,
-        providingPeersOf declaration: some DeclSyntaxProtocol,
+        providingMembersOf declaration: some DeclGroupSyntax,
         in context: some MacroExpansionContext
     ) throws -> [DeclSyntax] {
         guard let structDecl = declaration.as(StructDeclSyntax.self) else {
@@ -25,14 +26,14 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
                 continue
             }
 
-            // AttributeListSyntax is non-optional in your toolchain.
+            // AttributeListSyntax is non-optional in modern SwiftSyntax.
             let isOverridable: Bool = varDecl.attributes.contains {
                 $0.as(AttributeSyntax.self)?
                     .attributeName.as(IdentifierTypeSyntax.self)?
                     .name.text == "Overridable"
             }
 
-            // Remove the @Overridable attribute from the synthesized structs
+            // Remove the @Overridable attribute from synthesized members
             var cleanedVarDecl = varDecl
             let filteredElements: [AttributeListSyntax.Element] = varDecl.attributes.compactMap { element in
                 if let attr = element.as(AttributeSyntax.self),
@@ -50,23 +51,64 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
             }
         }
 
+        // Generate nested types (e.g., Property.Definition, Property.Instance, etc.)
         let definitionStruct = createDefinitionStruct(baseName: baseName, properties: allProperties)
         let instanceStruct = createInstanceStruct(baseName: baseName, properties: allProperties)
         let overrideStruct = createOverrideStruct(baseName: baseName, properties: overridableProperties)
         let sourceEnum = createSourceEnum(baseName: baseName)
         let resolvedStruct = createResolvedStruct(baseName: baseName, properties: allProperties)
         let resolverStruct = createResolverStruct(baseName: baseName, allProperties: allProperties, overridableProperties: overridableProperties)
+        
+        let blockingInit = createBlockingUnavailableInit(baseName: baseName, properties: allProperties)
+        
+        // Note: We do NOT inject an init here to avoid having to initialize stored properties.
+        // If you need to prevent instantiation entirely, consider the "namespace enum" pattern
+        // discussed previously, or keep this struct internal.
+        return [blockingInit, definitionStruct, instanceStruct, overrideStruct, sourceEnum, resolvedStruct, resolverStruct]
+    }
 
-        return [definitionStruct, instanceStruct, overrideStruct, sourceEnum, resolvedStruct, resolverStruct]
+    // Mark any user-declared initializers inside the annotated type as unavailable.
+    // This does NOT affect the synthesized memberwise initializer (which only disappears
+    // if any initializer is declared).
+    public static func expansion(
+        of node: AttributeSyntax,
+        attachedTo declaration: some DeclGroupSyntax,
+        providingAttributesFor member: some DeclSyntaxProtocol,
+        in context: some MacroExpansionContext
+    ) throws -> [AttributeSyntax] {
+        guard member.is(InitializerDeclSyntax.self) else { return [] }
+        let baseName = declaration.as(StructDeclSyntax.self)?.name.text ?? "Type"
+        let unavailableAttr: AttributeSyntax = """
+        @available(*, unavailable, message: "Do not instantiate \(raw: baseName) directly. Use one of its nested types like .Definition or .Instance instead.")
+        """
+        return [unavailableAttr]
     }
 
     // --- Data Model Helpers ---
 
+    private static func createBlockingUnavailableInit(baseName: String, properties: [VariableDeclSyntax]) -> DeclSyntax {
+        let params = properties.compactMap { prop -> String? in
+            guard let binding = prop.bindings.first,
+                  let name = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
+                  let type = binding.typeAnnotation?.type.description.trimmedNonEmpty
+            else { return nil }
+            return "\(name): \(type)"
+        }.joined(separator: ", ")
+
+        let finalCode = """
+        @available(*, unavailable, message: "Do not instantiate '\(baseName)'. Use its nested types like .Definition, .Instance, or .Resolved instead.")
+        public init(\(params)) {
+            fatalError("This initializer cannot be called.")
+        }
+        """
+        return DeclSyntax(stringLiteral: finalCode)
+    }
+    
     private static func createDefinitionStruct(baseName: String, properties: [VariableDeclSyntax]) -> DeclSyntax {
         let propertyDecls = properties.map { $0.description }.joined(separator: "\n\n    ")
         return DeclSyntax("""
         /// Auto-generated `Definition` for \(raw: baseName).
-        public struct \(raw: baseName)Definition: Identifiable, Codable, Hashable {
+        public struct Definition: Identifiable, Codable, Hashable {
             public var id: UUID = UUID()
 
             \(raw: propertyDecls)
@@ -78,7 +120,7 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
         let propertyDecls = properties.map { $0.description }.joined(separator: "\n\n    ")
         return DeclSyntax("""
         /// Auto-generated ad-hoc `Instance` for \(raw: baseName).
-        public struct \(raw: baseName)Instance: Identifiable, Codable, Hashable {
+        public struct Instance: Identifiable, Codable, Hashable {
             public var id: UUID = UUID()
 
             \(raw: propertyDecls)
@@ -97,7 +139,7 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
             let optionalType = OptionalTypeSyntax(wrappedType: typeAnnotation.type)
             newBinding.typeAnnotation = TypeAnnotationSyntax(type: TypeSyntax(optionalType))
             newBinding.initializer = InitializerClauseSyntax(value: ExprSyntax(NilLiteralExprSyntax()))
-            newProperty.bindingSpecifier = .keyword(.var, trailingTrivia: .space)
+            newProperty.bindingSpecifier = .keyword(.var, trailingTrivia: .space) // avoid "varvalue"
             newProperty.bindings = PatternBindingListSyntax([newBinding])
             return newProperty
         }
@@ -105,7 +147,7 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
         let propertyDecls = overrideProperties.map { $0.description }.joined(separator: "\n    ")
         return DeclSyntax("""
         /// Auto-generated `Override` for \(raw: baseName).
-        public struct \(raw: baseName)Override: Identifiable, Codable, Hashable {
+        public struct Override: Identifiable, Codable, Hashable {
             public let definitionID: UUID
             public var id: UUID { definitionID }
 
@@ -119,7 +161,7 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
     private static func createSourceEnum(baseName: String) -> DeclSyntax {
         return DeclSyntax("""
         /// Auto-generated `Source` enum for \(raw: baseName).
-        public enum \(raw: baseName)Source: Hashable {
+        public enum Source: Hashable {
             case definition(definitionID: UUID)
             case instance(instanceID: UUID)
         }
@@ -127,9 +169,12 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
     }
 
     private static func createResolvedStruct(baseName: String, properties: [VariableDeclSyntax]) -> DeclSyntax {
+        // Ensure all properties in the view model are `var` for UI editing
+        // which aligns with typical mutation needs in view models
+        // (see: Swift's guidance on choosing let vs var) [swiftbysundell.com](https://www.swiftbysundell.com/articles/let-vs-var-for-swift-struct-properties/)
         let propertiesAsVars = properties.map { prop -> VariableDeclSyntax in
             var newProp = prop
-            newProp.bindingSpecifier = .keyword(.var, trailingTrivia: .space)
+            newProp.bindingSpecifier = .keyword(.var, trailingTrivia: .space) // avoid "varname"
             return newProp
         }
 
@@ -137,7 +182,7 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
 
         return DeclSyntax("""
         /// Auto-generated `Resolved` view model for \(raw: baseName).
-        public struct \(raw: baseName)Resolved: Identifiable, Hashable {
+        public struct Resolved: Identifiable, Hashable {
             public var id: UUID {
                 switch source {
                 case .definition(let definitionID):
@@ -147,7 +192,7 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
                 }
             }
 
-            public let source: \(raw: baseName)Source
+            public let source: Source
             \(raw: propertyDecls)
         }
         """)
@@ -176,25 +221,25 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
 
         return DeclSyntax("""
         /// Auto-generated `Resolver` for \(raw: baseName).
-        public struct \(raw: baseName)Resolver {
+        public struct Resolver {
             public static func resolve(
-                definitions: [\(raw: baseName)Definition],
-                overrides: [\(raw: baseName)Override],
-                instances: [\(raw: baseName)Instance]
-            ) -> [\(raw: baseName)Resolved] {
+                definitions: [Definition],
+                overrides: [Override],
+                instances: [Instance]
+            ) -> [Resolved] {
 
                 let overrideDict = Dictionary(uniqueKeysWithValues: overrides.map { ($0.definitionID, $0) })
 
-                let resolvedFromDefinitions = definitions.map { definition -> \(raw: baseName)Resolved in
+                let resolvedFromDefinitions = definitions.map { definition -> Resolved in
                     let override = overrideDict[definition.id]
-                    return \(raw: baseName)Resolved(
+                    return Resolved(
                         source: .definition(definitionID: definition.id),
                         \(raw: definitionInitializerArgs)
                     )
                 }
 
-                let resolvedFromInstances = instances.map { instance -> \(raw: baseName)Resolved in
-                    return \(raw: baseName)Resolved(
+                let resolvedFromInstances = instances.map { instance -> Resolved in
+                    return Resolved(
                         source: .instance(instanceID: instance.id),
                         \(raw: instanceInitializerArgs)
                     )
@@ -205,40 +250,6 @@ public struct ResolvableMacro: PeerMacro, ExtensionMacro {
         }
         """)
     }
-
-    public static func expansion(
-        of node: AttributeSyntax,
-        attachedTo declaration: some DeclGroupSyntax,
-        providingExtensionsOf type: some TypeSyntaxProtocol,
-        conformingTo protocols: [TypeSyntax],
-        in context: some MacroExpansionContext
-    ) throws -> [ExtensionDeclSyntax] {
-
-        guard let structDecl = declaration.as(StructDeclSyntax.self) else { return [] }
-        let baseName = structDecl.name.text
-
-        // Qualify peer types with the containing scope (e.g., "TestModels.") if present
-        let typeDesc = type.trimmed.description
-        let qualifier: String
-        if let dot = typeDesc.lastIndex(of: ".") {
-            qualifier = String(typeDesc[..<dot]) + "."
-        } else {
-            qualifier = ""
-        }
-
-        let ext = try ExtensionDeclSyntax("""
-        extension \(type.trimmed) {
-            public typealias Definition = \(raw: qualifier)\(raw: baseName)Definition
-            public typealias Instance   = \(raw: qualifier)\(raw: baseName)Instance
-            public typealias Override   = \(raw: qualifier)\(raw: baseName)Override
-            public typealias Resolved   = \(raw: qualifier)\(raw: baseName)Resolved
-            public typealias Source     = \(raw: qualifier)\(raw: baseName)Source
-            public typealias Resolver   = \(raw: qualifier)\(raw: baseName)Resolver
-        }
-        """)
-
-        return [ext]
-    }
 }
 
 @main
@@ -246,4 +257,11 @@ struct ResolvableMacroPlugin: CompilerPlugin {
     let providingMacros: [Macro.Type] = [
         ResolvableMacro.self,
     ]
+}
+
+extension String {
+    var trimmedNonEmpty: String? {
+        let s = self.trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? nil : s
+    }
 }

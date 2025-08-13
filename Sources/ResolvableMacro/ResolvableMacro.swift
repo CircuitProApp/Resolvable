@@ -3,17 +3,18 @@
 
 /// The `@Resolvable` macro generates all the necessary boilerplate for the
 /// definition/instance/override/resolved pattern.
-@attached(peer, names: arbitrary)
 @attached(
-    extension,
+    member,
     names:
         named(Definition),
         named(Instance),
         named(Override),
         named(Resolved),
         named(Source),
-        named(Resolver)
+        named(Resolver),
+        named(init)
 )
+@attached(memberAttribute)
 public macro Resolvable() = #externalMacro(module: "ResolvableMacroMacros", type: "ResolvableMacro")
 
 /// A property wrapper to mark which properties of a model can be
