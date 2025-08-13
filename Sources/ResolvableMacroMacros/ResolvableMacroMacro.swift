@@ -129,31 +129,45 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
     }
 
     private static func createOverrideStruct(baseName: String, properties: [VariableDeclSyntax]) -> DeclSyntax {
-        let overrideProperties = properties.map { property -> VariableDeclSyntax in
-            var newProperty = property
-            guard var newBinding = newProperty.bindings.first,
-                  let typeAnnotation = newBinding.typeAnnotation else {
-                return newProperty
-            }
+        var propertyDecls: [String] = []
+        var initParams: [String] = []
+        var initAssignments: [String] = []
 
-            let optionalType = OptionalTypeSyntax(wrappedType: typeAnnotation.type)
-            newBinding.typeAnnotation = TypeAnnotationSyntax(type: TypeSyntax(optionalType))
-            newBinding.initializer = InitializerClauseSyntax(value: ExprSyntax(NilLiteralExprSyntax()))
-            newProperty.bindingSpecifier = .keyword(.var, trailingTrivia: .space) // avoid "varvalue"
-            newProperty.bindings = PatternBindingListSyntax([newBinding])
-            return newProperty
+        for property in properties {
+            guard let binding = property.bindings.first,
+                  let name = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
+                  let type = binding.typeAnnotation?.type.trimmedDescription
+            else {
+                continue
+            }
+            
+            propertyDecls.append("public var \(name): \(type)?")
+            initParams.append("\(name): \(type)? = nil")
+            initAssignments.append("self.\(name) = \(name)")
         }
 
-        let propertyDecls = overrideProperties.map { $0.description }.joined(separator: "\n    ")
-        return DeclSyntax("""
-        /// Auto-generated `Override` for \(raw: baseName).
+        // THE FIX: The specialized convenience init has been removed.
+        // We only generate the main initializer, which is always correct.
+        let finalCode = """
+        /// Auto-generated `Override` for \(baseName).
         public struct Override: Identifiable, Codable, Hashable {
             public let definitionID: UUID
             public var id: UUID { definitionID }
 
-            \(raw: propertyDecls)
+            \(propertyDecls.joined(separator: "\n    "))
+
+            /// The main initializer, accepting an optional value for every overridable property.
+            public init(
+                definitionID: UUID,
+                \(initParams.joined(separator: ",\n            "))
+            ) {
+                self.definitionID = definitionID
+                \(initAssignments.joined(separator: "\n            "))
+            }
         }
-        """)
+        """
+        
+        return DeclSyntax(stringLiteral: finalCode)
     }
 
     // --- Logic and View Model Helpers ---
