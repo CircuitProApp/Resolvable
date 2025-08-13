@@ -26,7 +26,6 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
                 continue
             }
 
-            // AttributeListSyntax is non-optional in modern SwiftSyntax.
             let isOverridable: Bool = varDecl.attributes.contains {
                 $0.as(AttributeSyntax.self)?
                     .attributeName.as(IdentifierTypeSyntax.self)?
@@ -61,9 +60,6 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         
         let blockingInit = createBlockingUnavailableInit(baseName: baseName, properties: allProperties)
         
-        // Note: We do NOT inject an init here to avoid having to initialize stored properties.
-        // If you need to prevent instantiation entirely, consider the "namespace enum" pattern
-        // discussed previously, or keep this struct internal.
         return [blockingInit, definitionStruct, instanceStruct, overrideStruct, sourceEnum, resolvedStruct, resolverStruct]
     }
 
@@ -84,7 +80,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         return [unavailableAttr]
     }
 
-    // --- Data Model Helpers ---
+    // MARK: --- Data Model Helpers ---
 
     private static func createBlockingUnavailableInit(baseName: String, properties: [VariableDeclSyntax]) -> DeclSyntax {
         let params = properties.compactMap { prop -> String? in
@@ -146,8 +142,6 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             initAssignments.append("self.\(name) = \(name)")
         }
 
-        // THE FIX: The specialized convenience init has been removed.
-        // We only generate the main initializer, which is always correct.
         let finalCode = """
         /// Auto-generated `Override` for \(baseName).
         public struct Override: Identifiable, Codable, Hashable {
@@ -170,7 +164,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         return DeclSyntax(stringLiteral: finalCode)
     }
 
-    // --- Logic and View Model Helpers ---
+    // MARK: --- Logic and View Model Helpers ---
 
     private static func createSourceEnum(baseName: String) -> DeclSyntax {
         return DeclSyntax("""
@@ -183,12 +177,9 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
     }
 
     private static func createResolvedStruct(baseName: String, properties: [VariableDeclSyntax]) -> DeclSyntax {
-        // Ensure all properties in the view model are `var` for UI editing
-        // which aligns with typical mutation needs in view models
-        // (see: Swift's guidance on choosing let vs var) [swiftbysundell.com](https://www.swiftbysundell.com/articles/let-vs-var-for-swift-struct-properties/)
         let propertiesAsVars = properties.map { prop -> VariableDeclSyntax in
             var newProp = prop
-            newProp.bindingSpecifier = .keyword(.var, trailingTrivia: .space) // avoid "varname"
+            newProp.bindingSpecifier = .keyword(.var, trailingTrivia: .space)
             return newProp
         }
 
