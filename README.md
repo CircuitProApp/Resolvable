@@ -17,25 +17,7 @@ Macros are implemented using SwiftSyntax/SwiftSyntaxBuilder and attached macro A
 
 ## Installation
 
-Swift Package Manager:
-
-1) In Xcode: File > Add Packages… and paste your package URL.
-
-2) Or update `Package.swift`:
-
-```swift
-dependencies: [
-    .package(url: "https://github.com/your-org/Resolvable.git", from: "0.1.0")
-],
-targets: [
-    .target(
-        name: "YourApp",
-        dependencies: [
-            .product(name: "Resolvable", package: "Resolvable")
-        ]
-    )
-]
-```
+In Xcode: File > Add Packages… and paste your package URL.
 
 ## Quick start
 
