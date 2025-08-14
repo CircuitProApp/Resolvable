@@ -15,7 +15,7 @@
         named(init)
 )
 @attached(memberAttribute)
-public macro Resolvable() = #externalMacro(module: "ResolvableMacroMacros", type: "ResolvableMacro")
+public macro Resolvable() = #externalMacro(module: "ResolvableMacros", type: "ResolvableMacro")
 
 /// A property wrapper to mark which properties of a model can be
 /// overridden by an instance. This wrapper does nothing at runtime; it is

@@ -1,4 +1,4 @@
-import ResolvableMacro
+import Resolvable
 import Foundation
 
 @Resolvable

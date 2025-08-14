@@ -40,7 +40,7 @@ targets: [
 ## Quick start
 
 ```swift
-import ResolvableMacro
+import Resolvable
 
 @Resolvable
 struct Product {
