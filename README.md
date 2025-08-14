@@ -38,7 +38,7 @@ That’s it. The macro synthesizes:
 - `Product.Definition`: canonical data shape for definitions (`Identifiable`, `Codable`, `Hashable`).
 - `Product.Instance`: ad-hoc shape for instances (`Identifiable`, `Codable`, `Hashable`).
 - `Product.Override`: per-definition, optional overrides for `@Overridable` fields (`Identifiable`, `Codable`, `Hashable`).
-- `Product.Source`: tells whether a resolved item came from a definition or instance (`Hashable`).
+- `Product.Source`: provenance of a resolved item (`Hashable`).
 - `Product.Resolved`: the read-model with merged values (`Identifiable`, `Hashable`).
 - `Product.Resolver`: performs the merge.
 
@@ -46,52 +46,44 @@ That’s it. The macro synthesizes:
 
 ## What gets generated
 
-Given:
+Given the `Product` above, the macro generates (high-level overview):
 
-```swift
-@Resolvable
-struct Thing {
-    @Overridable var name: String
-    var count: Int
-}
-```
-
-The macro generates (high-level overview):
-
-- **`struct Thing.Definition`: Identifiable, Codable, Hashable**
+- `struct Product.Definition`: Identifiable, Codable, Hashable
   - `var id: UUID = UUID()`
-  - `let`/`var` stored properties cloned from `Thing` (minus the `@Overridable` wrapper).
+  - Stored properties cloned from `Product` (the `@Overridable` wrapper is stripped).
 
-- **`struct Thing.Instance`: Identifiable, Codable, Hashable**
+- `struct Product.Instance`: Identifiable, Codable, Hashable
   - `var id: UUID = UUID()`
   - Same property set as `Definition`.
 
-- **`struct Thing.Override`: Identifiable, Codable, Hashable**
+- `struct Product.Override`: Identifiable, Codable, Hashable
   - `let definitionID: UUID`
-  - Optional properties only for fields marked `@Overridable` (e.g., `name: String?`)
+  - Optional properties only for fields marked `@Overridable`
+    - e.g. `title: String?`, `price: Decimal?`
   - `var id: UUID { definitionID }`
 
-- **`enum Thing.Source`: Hashable**
+- `enum Product.Source`: Hashable
   - `.definition(definitionID: UUID)`
   - `.instance(instanceID: UUID)`
 
-- **`struct Thing.Resolved`: Identifiable, Hashable**
+- `struct Product.Resolved`: Identifiable, Hashable
   - `let source: Source`
   - All properties as `var` (even if original was `let`)
   - `var id: UUID` derived from `source`
 
-- **`struct Thing.Resolver`**
+- `struct Product.Resolver`
   - `static func resolve(definitions: [Definition], overrides: [Override], instances: [Instance]) -> [Resolved]`
 
-**Merge rules**:
-- For each definition, if an override exists for an overridable field, use it; otherwise use the definition’s value.
+### Merge rules
+- For each definition, if an override exists for an `@Overridable` field, use it; otherwise use the definition’s value.
 - Instances are copied through as-is.
-- The result preserves provenance via `source`.
+- The result preserves provenance via `Product.Source`.
 
-**Notes**:
+### Notes
 - Only stored properties without accessors are included. Computed properties or ones with explicit accessors are ignored.
-- The macro strips the `@Overridable` wrapper from synthesized nested types—it's purely a marker and has no runtime behavior in your models.
-
+- The `@Overridable` wrapper is a marker only; synthesized types store plain values.
+- `Product.Override` only contains optional properties for fields marked `@Overridable`. Non-overridable fields never appear there.
+- `Product.Override.id` equals `definitionID`.
 
 ### About the “ghost initializer” (direct init won’t work)
 
