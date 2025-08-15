@@ -17,7 +17,7 @@ Macros are implemented using SwiftSyntax/SwiftSyntaxBuilder and attached macro A
 
 ## Installation
 
-In Xcode: File > Add Packages… and paste your package URL.
+In Xcode: File > Add Packages… and paste the GitHub URL.
 
 ## Quick start
 
