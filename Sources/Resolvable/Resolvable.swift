@@ -22,9 +22,20 @@ public macro Resolvable() = #externalMacro(module: "ResolvableMacros", type: "Re
 /// only a marker for the `@Resolvable` macro to detect.
 @propertyWrapper
 public struct Overridable<Value> {
-    public var wrappedValue: Value
-
-    public init(wrappedValue: Value) {
-        self.wrappedValue = wrappedValue
+    // Compile-time only; never read at runtime.
+    public var wrappedValue: Value {
+        get { fatalError("Overridable is compile-time only") }
+        set { fatalError("Overridable is compile-time only") }
     }
+
+    public init() {}
+
+    // @Overridable(\Root.leaf)
+    public init(_ keyPath: AnyKeyPath) {}
+
+    // @Overridable(\Root.leaf, as: Leaf.self)
+    public init(_ keyPath: AnyKeyPath, as: Any.Type) {}
+
+    // Labeled variant, if you prefer: @Overridable(keyPath: \Root.leaf, as: Leaf.self)
+    public init(keyPath: AnyKeyPath, as: Any.Type? = nil) {}
 }

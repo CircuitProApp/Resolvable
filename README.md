@@ -2,7 +2,7 @@
 
 A Swift macro package that generates the boilerplate for a “definition / instance / override / resolved” data-model pattern. Mark a struct with `@Resolvable` and annotate any fields you want to be overridable with the `@Overridable` property wrapper. The macro synthesizes strongly-typed nested types and a resolver so you can merge definitions, per-definition overrides, and ad-hoc instances into a unified “resolved” view model.
 
-- Zero runtime magic: the macro generates plain Swift code you can read.
+- Zero runtime magic: the macro generates plain Swift you can read.
 - Clear type boundaries: `Definition`, `Instance`, `Override`, `Resolved`, `Source`, and `Resolver`.
 - Safety by construction: you cannot instantiate the base type directly (see “About the ghost initializer” below).
 
@@ -11,13 +11,9 @@ A Swift macro package that generates the boilerplate for a “definition / insta
 - Swift 5.9+ (macros)
 - Xcode 16+ (for Apple platforms)
 
-Macros are implemented using SwiftSyntax/SwiftSyntaxBuilder and attached macro APIs introduced to Swift 5.9. For background, see Swift’s macro pitch and syntax builder notes on the Swift Forums:
-- Attached macros pitch: [forums.swift.org](https://forums.swift.org/t/pitch-attached-macros/62812)
-- SwiftSyntaxBuilder announcement: [forums.swift.org](https://forums.swift.org/t/announcing-swiftsyntaxbuilder/56565)
-
 ## Installation
 
-In Xcode: File > Add Packages… and paste the GitHub URL.
+In Xcode: File > Add Packages… and paste the repository URL.
 
 ## Quick start
 
@@ -30,97 +26,238 @@ struct Product {
     var sku: String
     @Overridable var price: Decimal
     var isActive: Bool
+
+    // Nested leaf override: explicit root + explicit leaf type
+    @Overridable(\Shipping.carrier, as: String.self)
+    var shipping: Shipping
+}
+
+struct Shipping: Codable, Hashable, Equatable {
+    var weight: Double
+    var carrier: String
 }
 ```
 
-That’s it. The macro synthesizes:
+The macro synthesizes:
 
-- `Product.Definition`: canonical data shape for definitions (`Identifiable`, `Codable`, `Hashable`).
-- `Product.Instance`: ad-hoc shape for instances (`Identifiable`, `Codable`, `Hashable`).
-- `Product.Override`: per-definition, optional overrides for `@Overridable` fields (`Identifiable`, `Codable`, `Hashable`).
+- `Product.Definition`: canonical shape for definitions (`Identifiable`, `Codable`, `Hashable`).
+- `Product.Instance`: ad‑hoc shape for instances (`Identifiable`, `Codable`, `Hashable`).
+- `Product.Override`: optional overrides only for `@Overridable` fields (`Identifiable`, `Codable`, `Hashable`).
 - `Product.Source`: provenance of a resolved item (`Hashable`).
 - `Product.Resolved`: the read-model with merged values (`Identifiable`, `Hashable`).
 - `Product.Resolver`: performs the merge.
 
+### What `Override` looks like
+
+For the `Product` above, `Override` includes:
+
+- Whole-property overrides for `title` and `price`:
+  - `title: String?`
+  - `price: Decimal?`
+- Nested leaf override for `shipping.carrier`, emitted as `shipping_carrier: String?`
+
+```swift
+public struct Product.Override: Identifiable, Codable, Hashable {
+    public let definitionID: UUID
+    public var id: UUID { definitionID }
+
+    public var title: String?
+    public var price: Decimal?
+    public var shipping_carrier: String?
+
+    public init(definitionID: UUID,
+                title: String? = nil,
+                price: Decimal? = nil,
+                shipping_carrier: String? = nil) {
+        self.definitionID = definitionID
+        self.title = title
+        self.price = price
+        self.shipping_carrier = shipping_carrier
+    }
+}
+```
+
+### Merge rules
+
+- Definitions:
+  - For each `@Overridable` field, if an override exists, use it; otherwise use the definition’s value.
+  - For nested overrides, the macro mutates a copy of the nested struct (no need to call its memberwise init).
+- Instances:
+  - Passed through as-is (no overrides applied).
+- The result preserves provenance via `Product.Source`.
+
+### End‑to‑end example
+
+```swift
+@Resolvable
+struct Product {
+    @Overridable var title: String
+    var sku: String
+    @Overridable var price: Decimal
+    var isActive: Bool
+
+    @Overridable(\Shipping.carrier, as: String.self)
+    var shipping: Shipping
+}
+
+struct Shipping: Codable, Hashable, Equatable {
+    var weight: Double
+    var carrier: String
+}
+
+func runDemo() {
+    let mugID = UUID()
+    let shirtID = UUID()
+
+    let defs: [Product.Definition] = [
+        .init(id: mugID,
+              title: "Coffee Mug",
+              sku: "MUG-COFFEE-12OZ",
+              price: 12.99,
+              isActive: true,
+              shipping: .init(weight: 0.4, carrier: "UPS")),
+        .init(id: shirtID,
+              title: "T‑Shirt",
+              sku: "TSHIRT-BLACK-M",
+              price: 24.00,
+              isActive: false,
+              shipping: .init(weight: 0.2, carrier: "FedEx"))
+    ]
+
+    // Only override selected fields; others fall back to definition values
+    let ovs: [Product.Override] = [
+        .init(definitionID: shirtID,
+              title: "T‑Shirt (Promo)",
+              price: 19.00,
+              shipping_carrier: "DHL")
+    ]
+
+    // Instances must provide full nested values
+    let insts: [Product.Instance] = [
+        .init(title: "Sticker Pack",
+              sku: "STICKER-PACK",
+              price: 4.50,
+              isActive: true,
+              shipping: .init(weight: 0.05, carrier: "USPS"))
+    ]
+
+    let resolved = Product.Resolver.resolve(definitions: defs,
+                                            overrides: ovs,
+                                            instances: insts)
+
+    for r in resolved {
+        let source: String = {
+            switch r.source {
+            case .definition(let id): return "definition(\(id))"
+            case .instance(let id):   return "instance(\(id))"
+            }
+        }()
+        print("Resolved [\(source)]: title=\(r.title), sku=\(r.sku), price=\(r.price), " +
+              "isActive=\(r.isActive), shipping=(weight=\(r.shipping.weight), carrier=\(r.shipping.carrier))")
+    }
+}
+```
+
 ---
 
-## What gets generated
+## Using `@Overridable`
 
-Given the `Product` above, the macro generates (high-level overview):
+Accepted forms:
 
-- `struct Product.Definition`: Identifiable, Codable, Hashable
+- Whole property:
+  - `@Overridable var title: String`
+- Nested leaf (explicit root and explicit leaf type are required):
+  - `@Overridable(\Root.leaf, as: LeafType.self)`
+  - Example: `@Overridable(\Shipping.carrier, as: String.self)`
+
+Rules:
+
+- The key path must use an explicit root (e.g. `\Shipping.carrier`). Rootless paths like `\.carrier` are rejected with a diagnostic.
+- The `as:` leaf type is required. This keeps `Override` strongly typed and able to synthesize `Codable/Hashable/Equatable`.
+- Nested override fields are emitted as `parent_leaf` (e.g. `shipping_carrier`).
+
+Diagnostics:
+
+- Missing key path: “@Overridable requires a key-path (e.g. @Overridable(\Shipping.carrier, as: String.self))”
+- Rootless key path: “Use an explicit root in key path (e.g. \Shipping.carrier). Rootless paths (\.carrier) are not allowed.”
+- Missing leaf type: “Provide leaf type with ‘as: <Type>.self’”
+
+---
+
+## What gets generated (overview)
+
+- `struct <Base>.Definition`: `Identifiable`, `Codable`, `Hashable`
   - `var id: UUID = UUID()`
-  - Stored properties cloned from `Product` (the `@Overridable` wrapper is stripped).
+  - Stored properties cloned from the base type (wrapper removed).
 
-- `struct Product.Instance`: Identifiable, Codable, Hashable
+- `struct <Base>.Instance`: `Identifiable`, `Codable`, `Hashable`
   - `var id: UUID = UUID()`
   - Same property set as `Definition`.
 
-- `struct Product.Override`: Identifiable, Codable, Hashable
+- `struct <Base>.Override`: `Identifiable`, `Codable`, `Hashable`
   - `let definitionID: UUID`
   - Optional properties only for fields marked `@Overridable`
-    - e.g. `title: String?`, `price: Decimal?`
+  - Nested leafs emitted as `parent_leaf: <LeafType>?`
   - `var id: UUID { definitionID }`
 
-- `enum Product.Source`: Hashable
-  - `.definition(definitionID: UUID)`
-  - `.instance(instanceID: UUID)`
+- `enum <Base>.Source`: `Hashable`
+  - `.definition(definitionID: UUID)` and `.instance(instanceID: UUID)`
 
-- `struct Product.Resolved`: Identifiable, Hashable
+- `struct <Base>.Resolved`: `Identifiable`, `Hashable`
   - `let source: Source`
-  - All properties as `var` (even if original was `let`)
+  - All properties as `var` (even if the original was `let`)
   - `var id: UUID` derived from `source`
 
-- `struct Product.Resolver`
+- `struct <Base>.Resolver`
   - `static func resolve(definitions: [Definition], overrides: [Override], instances: [Instance]) -> [Resolved]`
-
-### Merge rules
-- For each definition, if an override exists for an `@Overridable` field, use it; otherwise use the definition’s value.
-- Instances are copied through as-is.
-- The result preserves provenance via `Product.Source`.
-
-### Notes
-- Only stored properties without accessors are included. Computed properties or ones with explicit accessors are ignored.
-- The `@Overridable` wrapper is a marker only; synthesized types store plain values.
-- `Product.Override` only contains optional properties for fields marked `@Overridable`. Non-overridable fields never appear there.
-- `Product.Override.id` equals `definitionID`.
-
-### About the “ghost initializer” (direct init won’t work)
-
-You cannot instantiate the base type that’s annotated with `@Resolvable`. The macro intentionally:
-
-- Injects an initializer on the base type that is annotated as unavailable and calls `fatalError` to make direct construction impossible.
-- Marks any user-declared initializers inside the annotated type as unavailable.
-
-This “blocks” both the synthesized memberwise initializer and any custom initializers, guiding you to use the nested types instead:
-
-- Use `YourType.Definition` for canonical data.
-- Use `YourType.Instance` for ad-hoc items.
-- Use `YourType.Override` to override only the fields you marked as `@Overridable`.
-
-Attempting to call `YourType(...)` will produce a compile-time error.
+  - Applies whole-property overrides directly, and nested overrides by mutating a local copy of the nested struct.
 
 ---
 
-## Design constraints and behavior
+## About the “ghost initializer” (why you can’t construct the base type)
 
-- **Supported declarations**: `@Resolvable` can be applied to structs only.
-- **Stored properties only**: members with accessor blocks are ignored.
-- **Mutability** is preserved in nested `Definition`/`Instance`, but `Resolved` uses `var` for all fields, enabling post-merge adjustments if desired.
+The macro injects an initializer on the base type that is annotated as unavailable and calls `fatalError`, and marks any user-declared initializers unavailable as well. This intentionally prevents calling the base type’s memberwise initializer and guides you to use the nested types instead. For background on Swift’s memberwise initializer behavior, see the glossary entry on the “Memberwise initializer” [hackingwithswift.com](https://www.hackingwithswift.com/glossary).
 
-**Identity**:
-- `Definition` and `Instance` carry their own `id: UUID` (defaulted to a random UUID; override if you need stable IDs).
-- `Resolved.id` equals the `definitionID` or `instanceID` depending on source.
-- `Override.id == definitionID`.
+Use these instead:
 
-**Codable**:
-- `Definition`, `Instance`, and `Override` conform to `Codable`.
-- `Resolved` and `Source` are **not** `Codable` by default (but `Source` is `Hashable`). Adjust as needed in your project if you fork.
+- `YourType.Definition` for canonical data
+- `YourType.Instance` for ad-hoc items
+- `YourType.Override` for per-definition overrides
 
 ---
 
-## Tips and gotchas
+## Codable / Hashable notes
 
-- If you need an overridable field, wrap it with `@Overridable`. Otherwise it won’t appear in `Override`.
-- If you declare any custom initializers inside the annotated type, they’ll be marked unavailable anyway; put your construction logic on the nested types or introduce factory helpers outside the base type.
-- When resolving, overrides are matched by `definitionID`. Make sure you pass the correct `id` when creating overrides.
+- `Definition`, `Instance`, and `Override` conform to `Codable` and `Hashable`.
+- Nested leaf fields must have concrete types that are themselves `Codable`/`Hashable`. If you introduce a non‑codable leaf type, you’ll need to remove `Codable` from `Override` (or add custom encoding).
+- Be aware of general `Codable` caveats when mixing synthesized coding with defaulted or computed members (see discussion and workarounds in Apple developer forums) [developer.apple.com](https://developer.apple.com/forums/thread/763667).
+
+---
+
+## Limitations
+
+- `@Resolvable` applies to `struct` types only.
+- Only stored properties without accessors are included. Members with accessor blocks are ignored.
+- Macros operate on syntax, not types; the macro requires you to specify the leaf type with `as: <Type>.self` for nested leaf overrides.
+- `Resolved` is not `Codable` by default. If you need it to be codable, you can fork and add conformance to the generated type, but consider how to encode `source`.
+
+---
+
+## FAQ
+
+- Why explicit `as: <Type>.self` for nested leafs?
+  - To keep generated `Override` fields strongly typed and codable/hashable without fragile type inference.
+- Can I shorten `as: String.self` further?
+  - You can add your own helper (in your app/library) such as:
+    ```swift
+    postfix operator ^
+    public postfix func ^<Root, Value>(kp: KeyPath<Root, Value>) -> Value.Type { Value.self }
+    // @Overridable(\Shipping.carrier, as: (\Shipping.carrier)^)
+    ```
+  - We keep the macro’s requirement explicit and stable.
+
+---
+
+## License
+
+MIT
