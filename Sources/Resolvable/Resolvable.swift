@@ -24,26 +24,40 @@ public macro Resolvable() = #externalMacro(module: "ResolvableMacros", type: "Re
 public struct Overridable<Value> {
     public let keyPath: AnyKeyPath?
     public let leafType: Any.Type?
-    public var wrappedValue: Value
 
-    // Whole-property overrides (default and memberwise init use this)
+    // Compile-time only; the base type annotated with @Resolvable is not meant to be instantiated.
+    public var wrappedValue: Value {
+        get { fatalError("Overridable is compile-time only") }
+        set { fatalError("Overridable is compile-time only") }
+    }
+
+    // 1) No-arg: @Overridable var x: T
+    public init() {
+        self.keyPath = nil
+        self.leafType = nil
+    }
+
+    // 2) Args-only: @Overridable(\Root.leaf, as: Leaf.self) var x: Root
+    public init(_ keyPath: AnyKeyPath, as leafType: Any.Type? = nil) {
+        self.keyPath = keyPath
+        self.leafType = leafType
+    }
+
+    // 3) wrappedValue only: @Overridable var x: T = default
     public init(wrappedValue: Value) {
         self.keyPath = nil
         self.leafType = nil
-        self.wrappedValue = wrappedValue
     }
 
-    // Unlabeled key-path form: @Overridable(\Root.leaf, as: ...)
+    // 4) wrappedValue + args: @Overridable(\Root.leaf, as: Leaf.self) var x: Root = default
     public init(wrappedValue: Value, _ keyPath: AnyKeyPath, as leafType: Any.Type? = nil) {
         self.keyPath = keyPath
         self.leafType = leafType
-        self.wrappedValue = wrappedValue
     }
 
-    // Labeled key-path form: @Overridable(keyPath: \Root.leaf, as: ...)
+    // Optional labeled variant
     public init(wrappedValue: Value, keyPath: AnyKeyPath, as leafType: Any.Type? = nil) {
         self.keyPath = keyPath
         self.leafType = leafType
-        self.wrappedValue = wrappedValue
     }
 }

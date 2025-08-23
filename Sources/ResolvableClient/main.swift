@@ -5,7 +5,7 @@ import Resolvable
 struct Product {
     @Overridable var title: String
     var sku: String
-    @Overridable var price: Decimal
+    @Overridable var price: Decimal = 10.0
     var isActive: Bool
     
     
