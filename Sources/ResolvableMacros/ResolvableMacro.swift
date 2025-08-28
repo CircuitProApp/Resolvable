@@ -6,6 +6,12 @@ import SwiftDiagnostics
 
 public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
 
+    // Default behavior for properties inside a @Resolvable struct
+    private enum ResolvableDefault {
+        case optIn         // Only properties marked @Overridable are overridable
+        case overridable   // All properties are overridable unless marked @Identity
+    }
+
     public static func expansion(
         of node: AttributeSyntax,
         providingMembersOf declaration: some DeclGroupSyntax,
@@ -16,28 +22,88 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         }
         let baseName = structDecl.name.text
 
+        // Parse @Resolvable(default: .overridable), default is .optIn
+        var defaultBehavior: ResolvableDefault = .optIn
+        if let args = node.arguments?.as(LabeledExprListSyntax.self),
+           let defaultArg = args.first(where: { $0.label?.text == "default" }) {
+            let text = defaultArg.expression.trimmedDescription
+            if text == ".overridable" || text.hasSuffix(".overridable") || text == "\"overridable\"" {
+                defaultBehavior = .overridable
+            }
+        }
+
         var allProperties: [VariableDeclSyntax] = []
         var fullOverrides: [VariableDeclSyntax] = []
-        // parent -> [(leafName, leafType)]
+        // For nested overrides: parentProp -> [(leafName, leafType)]
         var nestedOverrides: [String: [(leafName: String, leafType: String)]] = [:]
 
         for member in structDecl.memberBlock.members {
             guard let varDecl = member.decl.as(VariableDeclSyntax.self),
                   let binding = varDecl.bindings.first,
+                  // Ignore computed properties
                   binding.accessorBlock == nil
             else { continue }
 
-            let hasOverridable = varDecl.attributes.contains {
+            // Attribute presence
+            let overridableAttr = varDecl.attributes.first {
                 $0.as(AttributeSyntax.self)?
                     .attributeName.as(IdentifierTypeSyntax.self)?
                     .name.text == "Overridable"
+            }?.as(AttributeSyntax.self)
+
+            let hasIdentity = varDecl.attributes.contains {
+                $0.as(AttributeSyntax.self)?
+                    .attributeName.as(IdentifierTypeSyntax.self)?
+                    .name.text == "Identity"
+            }
+            let hasOverridable = (overridableAttr != nil)
+            let overridableHasArgs: Bool = overridableAttr?
+                .arguments?
+                .as(LabeledExprListSyntax.self)
+                .map { !$0.isEmpty } ?? false
+
+            // Conflict: both @Identity and @Overridable on the same property
+            if hasIdentity && hasOverridable {
+                context.diagnose(Diagnostic(
+                    node: Syntax(varDecl),
+                    message: ResolvableMessage(
+                        id: "conflictingAttributes",
+                        message: "Cannot apply '@Identity' and '@Overridable' to the same property.",
+                        severity: .error
+                    )
+                ))
             }
 
-            // Clean attributes for re-emission into generated types
+            // Redundancy warnings:
+            // - When default is .overridable, a no-arg @Overridable is redundant.
+            if defaultBehavior == .overridable, hasOverridable, !overridableHasArgs {
+                context.diagnose(Diagnostic(
+                    node: Syntax(overridableAttr!),
+                    message: ResolvableMessage(
+                        id: "redundantOverridable",
+                        message: "'@Overridable' is redundant when using '@Resolvable(default: .overridable)' unless you are specifying nested key-path overrides.",
+                        severity: .warning
+                    )
+                ))
+            }
+            // - When default is .optIn, @Identity is redundant (everything is non-overridable by default).
+            if defaultBehavior == .optIn, hasIdentity, !hasOverridable {
+                context.diagnose(Diagnostic(
+                    node: Syntax(varDecl),
+                    message: ResolvableMessage(
+                        id: "redundantIdentity",
+                        message: "'@Identity' is redundant with '@Resolvable' default behavior (opt-in). Properties are non-overridable unless marked '@Overridable'.",
+                        severity: .warning
+                    )
+                ))
+            }
+
+            // Clean attributes (remove @Overridable and @Identity) for re-emission
             var cleanedVarDecl = varDecl
             let filtered = varDecl.attributes.compactMap { elem -> AttributeListSyntax.Element? in
                 if let attr = elem.as(AttributeSyntax.self),
-                   attr.attributeName.as(IdentifierTypeSyntax.self)?.name.text == "Overridable" {
+                   let name = attr.attributeName.as(IdentifierTypeSyntax.self)?.name.text,
+                   name == "Overridable" || name == "Identity" {
                     return nil
                 }
                 return elem
@@ -45,33 +111,39 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             cleanedVarDecl.attributes = AttributeListSyntax(filtered)
             allProperties.append(cleanedVarDecl)
 
-            guard hasOverridable else { continue }
+            // Decide overridability with default behavior + annotations
+            let isOverridable: Bool = {
+                if hasIdentity { return false }
+                if hasOverridable { return true }
+                return (defaultBehavior == .overridable)
+            }()
 
-            let propName = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text ?? ""
+            guard isOverridable else { continue }
 
-            // Extract the @Overridable(...) attribute instance
-            guard let attr = varDecl.attributes.first(where: {
-                $0.as(AttributeSyntax.self)?
-                    .attributeName.as(IdentifierTypeSyntax.self)?
-                    .name.text == "Overridable"
-            })?.as(AttributeSyntax.self) else {
-                continue
-            }
+            // Property name (skip odd patterns just in case)
+            guard let propName = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
+                  !propName.isEmpty
+            else { continue }
 
-            // If it has no args, it's a whole-property override
-            guard let args = attr.arguments?.as(LabeledExprListSyntax.self),
+            // If attribute not present or has no args → whole-property override
+            guard let attr = overridableAttr,
+                  let args = attr.arguments?.as(LabeledExprListSyntax.self),
                   !args.isEmpty
             else {
+                // Whole property override
                 fullOverrides.append(cleanedVarDecl)
                 continue
             }
 
-            // 1) keyPath: unlabeled first argument or labeled `keyPath:`
+            // Nested override path and leaf type parsing
+
+            // Key path: unlabeled first argument, or labeled keyPath:
             let keyPathExpr: KeyPathExprSyntax? = {
                 if let labeled = args.first(where: { $0.label?.text == "keyPath" })?.expression.as(KeyPathExprSyntax.self) {
                     return labeled
                 }
-                if let first = args.first, first.label == nil, let kp = first.expression.as(KeyPathExprSyntax.self) {
+                if let first = args.first, first.label == nil,
+                   let kp = first.expression.as(KeyPathExprSyntax.self) {
                     return kp
                 }
                 return nil
@@ -84,26 +156,28 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             }
 
             // Require explicit root (\Shipping.carrier), not rootless (\.carrier)
-            guard let _ = kp.explicitRootTypeName else {
+            guard kp.explicitRootTypeName != nil else {
                 diagnoseError(context, node: Syntax(kp), id: "explicitRootRequired",
                               message: "Use an explicit root in key path (e.g. \\Shipping.carrier). Rootless paths (\\.carrier) are not allowed.")
                 continue
             }
 
-            guard let leafName = kp.lastComponentName else {
+            // Leaf name (e.g., "carrier")
+            guard let leafName = kp.lastComponentName, !leafName.isEmpty else {
                 diagnoseError(context, node: Syntax(kp), id: "missingLeaf",
                               message: "Key path must include a leaf property (e.g. \\Shipping.carrier).")
                 continue
             }
 
-            // 2) leaf type via `as: Type.self`
+            // Leaf type via as: Type.self
             let asExpr = args.first(where: { $0.label?.text == "as" })?.expression
-            guard let leafTypeText = asExpr.flatMap(extractTypeName(from:)), !leafTypeText.isEmpty else {
+            guard let leafTypeText = asExpr.flatMap(Self.extractTypeName(from:)), !leafTypeText.isEmpty else {
                 diagnoseError(context, node: Syntax(attr), id: "missingLeafType",
                               message: "Provide leaf type with 'as: <Type>.self' (e.g. @Overridable(\\Shipping.carrier, as: String.self)).")
                 continue
             }
 
+            // Record nested override
             nestedOverrides[propName, default: []].append((leafName: leafName, leafType: leafTypeText))
         }
 
@@ -123,7 +197,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         ]
     }
 
-    // Mark user-defined inits as unavailable
+    // Mark user-defined inits in the base type as unavailable (discourage direct instantiation)
     public static func expansion(
         of node: AttributeSyntax,
         attachedTo declaration: some DeclGroupSyntax,
@@ -139,7 +213,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         return [attr]
     }
 
-    // MARK: Generated types
+    // MARK: - Generated types
 
     private static func createBlockingUnavailableInit(baseName: String,
                                                       properties: [VariableDeclSyntax]) -> DeclSyntax {
@@ -199,7 +273,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             assigns.append("self.\(n) = \(n)")
         }
 
-        // Nested overrides: `parent_leaf`
+        // Nested overrides → parent_leaf
         for (parent, nested) in nestedOverrides.sorted(by: { $0.key < $1.key }) {
             for leaf in nested {
                 let varName = "\(parent)_\(leaf.leafName)"
@@ -265,10 +339,12 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
                                              nestedOverrides: [String: [(leafName: String, leafType: String)]]
     ) -> DeclSyntax {
         let fullSet: Set<String> = Set(fullOverrides.compactMap {
-            $0.bindings.first?.pattern.as(IdentifierPatternSyntax.self)?.identifier.text
+            $0.bindings.first?
+                .pattern.as(IdentifierPatternSyntax.self)?
+                .identifier.text
         })
 
-        // Definitions -> Resolved: apply overrides
+        // From Definition → Resolved (apply overrides)
         let defArgs = allProperties.map { p -> String in
             guard let b = p.bindings.first,
                   let n = b.pattern.as(IdentifierPatternSyntax.self)?.identifier.text
@@ -292,7 +368,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             }
         }.joined(separator: ",\n                                    ")
 
-        // Instances -> Resolved: pass-through
+        // From Instance → Resolved (pass-through)
         let instArgs = allProperties.compactMap { p -> String? in
             guard let b = p.bindings.first,
                   let n = b.pattern.as(IdentifierPatternSyntax.self)?.identifier.text
@@ -324,7 +400,9 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
     // Extract "String" from "String.self"
     private static func extractTypeName(from expr: ExprSyntax) -> String? {
         let text = expr.trimmedDescription
-        if text.hasSuffix(".self") { return String(text.dropLast(5)) }
+        if text.hasSuffix(".self") {
+            return String(text.dropLast(5))
+        }
         return text
     }
 }
@@ -355,6 +433,8 @@ struct ResolvableMacroPlugin: CompilerPlugin {
     let providingMacros: [Macro.Type] = [ResolvableMacro.self]
 }
 
+// Helpers
+
 extension String {
     var trimmedNonEmpty: String? {
         let s = trimmingCharacters(in: .whitespacesAndNewlines)
@@ -362,12 +442,20 @@ extension String {
     }
 }
 
-// KeyPath helpers
+extension SyntaxProtocol {
+    var trimmedDescription: String {
+        self.description.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// KeyPath helpers (explicit root, leaf component)
 extension KeyPathExprSyntax {
     var explicitRootTypeName: String? {
         self.root?.as(IdentifierTypeSyntax.self)?.name.text
     }
     var lastComponentName: String? {
-        self.components.last?.component.as(KeyPathPropertyComponentSyntax.self)?.declName.baseName.text
+        self.components.last?
+            .component.as(KeyPathPropertyComponentSyntax.self)?
+            .declName.baseName.text
     }
 }

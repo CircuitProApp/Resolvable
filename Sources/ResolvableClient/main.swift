@@ -7,8 +7,7 @@ struct Product {
     var sku: String
     @Overridable var price: Decimal = 10.0
     var isActive: Bool
-    
-    
+
     @Overridable(\Shipping.carrier, as: String.self) var shipping: Shipping
 }
 

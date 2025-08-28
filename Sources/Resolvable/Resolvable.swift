@@ -1,6 +1,12 @@
 // The Swift Programming Language
 // https://docs.swift.org/swift-book
 
+// Default behavior for properties inside a @Resolvable struct
+public enum ResolvableDefault {
+    case optIn         // Only properties marked @Overridable are overridable
+    case overridable   // All properties are overridable unless marked @Identity
+}
+
 /// The `@Resolvable` macro generates all the necessary boilerplate for the
 /// definition/instance/override/resolved pattern.
 @attached(
@@ -15,7 +21,7 @@
         named(init)
 )
 @attached(memberAttribute)
-public macro Resolvable() = #externalMacro(module: "ResolvableMacros", type: "ResolvableMacro")
+public macro Resolvable(default: ResolvableDefault = .optIn) = #externalMacro(module: "ResolvableMacros", type: "ResolvableMacro")
 
 /// A property wrapper to mark which properties of a model can be
 /// overridden by an instance. This wrapper does nothing at runtime; it is
@@ -59,5 +65,22 @@ public struct Overridable<Value> {
     public init(wrappedValue: Value, keyPath: AnyKeyPath, as leafType: Any.Type? = nil) {
         self.keyPath = keyPath
         self.leafType = leafType
+    }
+}
+
+/// A property wrapper to mark which properties of a model can not be
+/// overridden. This wrapper does nothing at runtime; it is
+/// only a marker for the `@Resolvable` macro to detect.
+@propertyWrapper
+public struct Identity<Value> {
+    private var value: Value
+
+    public init(wrappedValue: Value) {
+        self.value = wrappedValue
+    }
+
+    public var wrappedValue: Value {
+        get { value }
+        set { value = newValue }
     }
 }
