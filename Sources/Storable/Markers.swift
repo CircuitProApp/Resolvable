@@ -29,25 +29,53 @@ public struct InstanceStored<Value> {
 
 @propertyWrapper
 public struct StorableRelationship<Value> {
-    public enum Source { case storable, resolvable }
 
-    // Use this when no initial value is provided (e.g., `@StorableRelationship(...) var rel: T`)
     public init(
-        source: Source = .storable,
         deleteRule: Schema.Relationship.DeleteRule? = nil,
         inverse: AnyKeyPath? = nil
     ) {}
 
-    // Overload to allow `= initialValue` if ever used
     public init(
         wrappedValue: Value,
-        source: Source = .storable,
         deleteRule: Schema.Relationship.DeleteRule? = nil,
         inverse: AnyKeyPath? = nil
     ) {}
 
     public var wrappedValue: Value {
         get { fatalError("StorableRelationship is a marker used by @Storable; not for runtime use.") }
+        set {}
+    }
+}
+
+@propertyWrapper
+public struct ResolvableProperty<Value> {
+    /// Configures the macro to generate storage for a nested resolvable property.
+    /// The types passed here are markers only; their values are not used at runtime.
+    /// The macro inspects the code you write to determine what to generate.
+    ///
+    //  Example:
+    //  @ResolvableProperty(
+    //      definition: CircuitText.Definition.self,
+    //      instance: [CircuitText.Override.self, CircuitText.Instance.self]
+    //  )
+    public init(
+        definition: Any.Type,
+        instance: [Any.Type]
+    ) {
+        // This initializer is empty. Its only purpose is to provide a valid
+        // syntactic structure for the developer to write the command.
+    }
+    
+    public init(
+        wrappedValue: Value,
+        definition: Any.Type,
+        instance: [Any.Type]
+    ) {
+        // Also empty.
+    }
+    
+    public var wrappedValue: Value {
+        get { fatalError("This is a marker attribute for the @Storable macro and should not be accessed at runtime.") }
         set {}
     }
 }

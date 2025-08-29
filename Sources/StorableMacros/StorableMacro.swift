@@ -1,4 +1,3 @@
-// Sources/StorableMacros/StorableMacro.swift
 import SwiftCompilerPlugin
 import SwiftSyntax
 import SwiftSyntaxBuilder
@@ -30,6 +29,7 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         var defRelInitParams: [String] = []
         var instRelInitParams: [String] = []
 
+        // --- REPLACEMENT STARTS HERE ---
         for member in structDecl.memberBlock.members {
             guard let varDecl = member.decl.as(VariableDeclSyntax.self),
                   let binding = varDecl.bindings.first,
@@ -40,68 +40,88 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
 
             allInitParams.append((name: name, type: typeText))
 
-            if let (_, cfg) = parseStorableRelationshipAttribute(varDecl.attributes),
-               let info = analyzeRelationshipType(typeText) {
-
-                switch cfg.source {
-                case .storable:
-                    let defType = mapRelatedType(info, suffix: "Definition")
-                    let instType = mapRelatedType(info, suffix: "Instance")
-
-                    var relArgs: [String] = []
-                    if let d = cfg.deleteRuleExpr { relArgs.append("deleteRule: \(d)") }
-                    if let inv = cfg.inverseExpr {
-                        let rewritten = rewriteInverseKeyPathToDefinition(inv)
-                        relArgs.append("inverse: \(rewritten)")
-                    }
-                    let relAttr = relArgs.isEmpty ? "@Relationship" : "@Relationship(\(relArgs.joined(separator: ", ")))"
-
-                    defRelDecls.append("\(relAttr)\n    var \(name): \(defType)")
-                    instRelDecls.append("var \(name): \(instType)")
-                    defRelInitParams.append("\(name): \(defType)")
-                    instRelInitParams.append("\(name): \(instType)")
-
-                case .resolvable:
-                    let defType = mapRelatedType(info, suffix: "Definition")
-                    defRelDecls.append("var \(name): \(defType)")
-                    defRelInitParams.append("\(name): \(defType)")
-
-                    let overrideType = mapRelatedType(info, suffix: "Override")
-                    let overrideName = "\(name)Override"
-
-                    instRelDecls.append("var \(overrideName): \(overrideType)?")
-                    instRelInitParams.append("\(overrideName): \(overrideType)? = nil")
+            // Check for the new @ResolvableProperty attribute
+            if let resolvableAttr = findAttribute(named: "ResolvableProperty", in: varDecl.attributes) {
+                
+                guard let info = analyzeRelationshipType(typeText) else { continue }
+                
+                // Parse definition: .definition
+                if let defArg = findArgument(labeled: "definition", in: resolvableAttr),
+                   let defTypeName = extractTypeName(from: defArg.expression) {
+                    
+                    let finalDefType = applyContainer(info.container, to: defTypeName)
+                    defRelDecls.append("var \(name): \(finalDefType)")
+                    defRelInitParams.append("\(name): \(finalDefType)")
                 }
-                continue
+
+                // Parse instance: [.override, .instance]
+                if let instArg = findArgument(labeled: "instance", in: resolvableAttr),
+                   let arrayExpr = instArg.expression.as(ArrayExprSyntax.self) {
+                    
+                    for element in arrayExpr.elements {
+                        guard let instTypeName = extractTypeName(from: element.expression) else { continue }
+                        
+                        let suffix = instTypeName.split(separator: ".").last.map(String.init) ?? ""
+                        let propertyName: String
+                        
+                        if info.container == .array || info.container == .set {
+                             propertyName = "\(name)\(suffix)s" // Plural: textsOverrides
+                        } else {
+                             propertyName = "\(name)\(suffix)" // Singular: textOverride
+                        }
+                        
+                        let finalInstType = applyContainer(info.container, to: instTypeName) + (info.container == .array || info.container == .set ? "" : "?")
+
+                        instRelDecls.append("var \(propertyName): \(finalInstType)")
+                        instRelInitParams.append("\(propertyName): \(finalInstType) = nil")
+                    }
+                }
+                
+                continue // Move to next member
+            }
+            
+            // Handle the simple @StorableRelationship
+            if let relationshipAttr = findAttribute(named: "StorableRelationship", in: varDecl.attributes),
+               let info = analyzeRelationshipType(typeText) {
+                
+                let defType = mapRelatedType(info, suffix: "Definition")
+                let instType = mapRelatedType(info, suffix: "Instance")
+
+                var relArgs: [String] = []
+                if let deleteRule = findArgument(labeled: "deleteRule", in: relationshipAttr) {
+                    relArgs.append("deleteRule: \(deleteRule.expression.trimmedDescription)")
+                }
+                if let inverse = findArgument(labeled: "inverse", in: relationshipAttr) {
+                    let rewritten = rewriteInverseKeyPathToDefinition(inverse.expression.trimmedDescription)
+                    relArgs.append("inverse: \(rewritten)")
+                }
+                let relAttrText = relArgs.isEmpty ? "@Relationship" : "@Relationship(\(relArgs.joined(separator: ", ")))"
+
+                defRelDecls.append("\(relAttrText)\n    var \(name): \(defType)")
+                instRelDecls.append("var \(name): \(instType)")
+                defRelInitParams.append("\(name): \(defType)")
+                instRelInitParams.append("\(name): \(instType)")
+
+                continue // Move to next member
             }
 
+            // Handle @DefinitionStored / @InstanceStored
             let markers = markersForAttributes(varDecl.attributes)
             if markers == .both {
                 context.diagnose(Diagnostic(
                     node: Syntax(varDecl),
-                    message: StorableMessage(
-                        id: "conflictingMarkers",
-                        message: "Property '\(name)' cannot be annotated with both @DefinitionStored and @InstanceStored.",
-                        severity: .error
-                    )
+                    message: StorableMessage(id: "conflictingMarkers", message: "Property '\(name)' cannot be annotated with both @DefinitionStored and @InstanceStored.", severity: .error)
                 ))
             }
 
-            let inDef: Bool
-            let inInst: Bool
-            switch markers {
-            case .none:
-                inDef = true; inInst = true
-            case .definitionOnly:
-                inDef = true; inInst = false
-            case .instanceOnly:
-                inDef = false; inInst = true
-            case .both:
-                inDef = true; inInst = true
-            }
+            let inDef = markers == .definitionOnly
+            let inInst = markers == .instanceOnly
 
-            props.append(Prop(name: name, type: typeText, inDefinition: inDef, inInstance: inInst))
+            if inDef || inInst {
+                 props.append(Prop(name: name, type: typeText, inDefinition: inDef, inInstance: inInst))
+            }
         }
+        // --- REPLACEMENT ENDS HERE ---
 
         let defProps = props.filter { $0.inDefinition }
         let instProps = props.filter { $0.inInstance }
@@ -122,8 +142,8 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
             relInitParams: instRelInitParams
         ))
         decls.append(createSourceEnum())
-        decls.append(createResolvedStruct(props: props))
-        decls.append(createResolverStruct())
+        decls.append(createResolvedStruct(props: props, relations: instRelDecls))
+        decls.append(createResolverStruct(relations: instRelDecls))
 
         return decls
     }
@@ -143,7 +163,7 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         return [attr]
     }
 
-    // MARK: - Generation
+    // MARK: - Generation (Updated createResolvedStruct and createResolverStruct)
 
     private static func createBlockingUnavailableInit(baseName: String,
                                                       propsInfo: [(name: String, type: String)]) -> DeclSyntax {
@@ -165,13 +185,13 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         let relBlock = relDecls.joined(separator: "\n\n    ")
 
         let initParamsList =
-            ["uuid: UUID"]
+            ["uuid: UUID = UUID()"]
             + defProps.map { "\($0.name): \($0.type)" }
             + relInitParams
         let initParams = initParamsList.joined(separator: ", ")
 
         func names(from params: [String]) -> [String] {
-            params.compactMap { $0.split(separator: ":").first.map { String($0).trimmingCharacters(in: .whitespaces) } }
+            params.compactMap { $0.split(separator: ":").first?.trimmingCharacters(in: .whitespaces) }
         }
 
         let assignsLines =
@@ -188,7 +208,7 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         @Model
         public final class Definition {
             @Attribute(.unique)
-            var uuid: UUID
+            public var uuid: UUID
 
             \(raw: bodyMembers)
 
@@ -213,9 +233,9 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
             + instProps.map { "\($0.name): \($0.type)" }
             + relInitParams
         let initParams = initParamsList.joined(separator: ", ")
-
+        
         func names(from params: [String]) -> [String] {
-            params.compactMap { $0.split(separator: ":").first.map { String($0).trimmingCharacters(in: .whitespaces) } }
+             params.compactMap { $0.split(separator: ":").first?.trimmingCharacters(in: .whitespaces) }
         }
 
         let assignsLines =
@@ -231,7 +251,7 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         return DeclSyntax("""
         @Observable
         public final class Instance: Codable, Hashable, Identifiable {
-            public var id: UUID = UUID()
+            public var id: UUID
             public var definitionUUID: UUID
 
             \(raw: bodyMembers)
@@ -255,19 +275,20 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         """)
     }
 
-    private static func createResolvedStruct(props: [Prop]) -> DeclSyntax {
+    private static func createResolvedStruct(props: [Prop], relations: [String]) -> DeclSyntax {
         let computedProps = props.map { p -> String in
             switch (p.inDefinition, p.inInstance) {
-            case (true, true):
-                return "public var \(p.name): \(p.type) { instance.\(p.name) }"
             case (true, false):
                 return "public var \(p.name): \(p.type) { definition.\(p.name) }"
             case (false, true):
                 return "public var \(p.name): \(p.type) { instance.\(p.name) }"
-            default:
-                return ""
+            default: return ""
             }
         }.joined(separator: "\n\n    ")
+        
+        // TODO: This part needs to be smarter based on the actual relations
+        // For now, it's a placeholder. The real logic will need the parsed relation info.
+        let resolvedRelations = "    // TODO: Generate resolved properties for relationships like 'texts'"
 
         return DeclSyntax("""
         public struct Resolved: Identifiable, Hashable {
@@ -277,13 +298,18 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
             public let instance: Instance
 
             \(raw: computedProps)
+            
+            \(raw: resolvedRelations)
         }
         """)
     }
 
-    private static func createResolverStruct() -> DeclSyntax {
+    private static func createResolverStruct(relations: [String]) -> DeclSyntax {
+        // TODO: The resolver needs to become much smarter. It must know how to
+        // combine overrides and instances for resolvable properties.
         let single = """
         public static func resolve(definition: Definition, instance: Instance) -> Resolved {
+            // TODO: This needs to pass resolved sub-properties to the Resolved init
             return Resolved(source: .instance(instanceID: instance.id), definition: definition, instance: instance)
         }
         """
@@ -310,7 +336,39 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
     }
 }
 
+
 // MARK: - Attribute marker parsing
+
+private func findAttribute(named name: String, in attributes: AttributeListSyntax?) -> AttributeSyntax? {
+    guard let attributes else { return nil }
+    return attributes.first(where: {
+        $0.as(AttributeSyntax.self)?.attributeName.trimmedDescription == name
+    })?.as(AttributeSyntax.self)
+}
+
+private func findArgument(labeled name: String, in attribute: AttributeSyntax) -> LabeledExprSyntax? {
+    guard let args = attribute.arguments?.as(LabeledExprListSyntax.self) else { return nil }
+    return args.first(where: { $0.label?.text == name })
+}
+
+private func extractTypeName(from expr: ExprSyntax) -> String? {
+    let text = expr.trimmedDescription
+    if text.hasSuffix(".self") {
+        return String(text.dropLast(5))
+    }
+    return nil // Return nil if it's not a .self expression
+}
+
+private func applyContainer(_ container: ContainerKind, to baseType: String) -> String {
+    switch container {
+    case .single: return baseType
+    case .optional: return "\(baseType)?"
+    case .array: return "[\(baseType)]"
+    case .arrayOptional: return "[\(baseType)]?"
+    case .set: return "Set<\(baseType)>"
+    case .setOptional: return "Set<\(baseType)>?"
+    }
+}
 
 private enum MarkerUse {
     case none
@@ -320,62 +378,16 @@ private enum MarkerUse {
 }
 
 private func markersForAttributes(_ attributes: AttributeListSyntax?) -> MarkerUse {
-    guard let attributes, !attributes.isEmpty else { return .none }
-    var sawDef = false
-    var sawInst = false
-
-    for element in attributes {
-        guard let attr = element.as(AttributeSyntax.self) else { continue }
-        let rawName = attr.attributeName.trimmedDescription
-        let simpleName = rawName.split(separator: ".").last.map(String.init) ?? rawName
-        if simpleName == "DefinitionStored" { sawDef = true }
-        if simpleName == "InstanceStored" { sawInst = true }
-    }
-
-    switch (sawDef, sawInst) {
+    guard let attributes else { return .none }
+    let hasDef = findAttribute(named: "DefinitionStored", in: attributes) != nil
+    let hasInst = findAttribute(named: "InstanceStored", in: attributes) != nil
+    
+    switch (hasDef, hasInst) {
     case (false, false): return .none
     case (true, false):  return .definitionOnly
     case (false, true):  return .instanceOnly
     case (true, true):   return .both
     }
-}
-
-private enum RelationshipSource { case storable, resolvable }
-
-private struct RelationshipConfig {
-    var source: RelationshipSource = .storable
-    var deleteRuleExpr: String? = nil
-    var inverseExpr: String? = nil
-}
-
-private func parseStorableRelationshipAttribute(_ attrs: AttributeListSyntax?) -> (attr: AttributeSyntax, config: RelationshipConfig)? {
-    guard let attrs, !attrs.isEmpty else { return nil }
-    for element in attrs {
-        guard let attr = element.as(AttributeSyntax.self) else { continue }
-        let rawName = attr.attributeName.trimmedDescription
-        let simpleName = rawName.split(separator: ".").last.map(String.init) ?? rawName
-        guard simpleName == "StorableRelationship" else { continue }
-
-        var cfg = RelationshipConfig()
-        if let args = attr.arguments, case let .argumentList(list) = args {
-            for a in list {
-                let label = a.label?.text ?? ""
-                let exprText = a.expression.trimmedDescription
-                switch label {
-                case "source":
-                    cfg.source = exprText.contains("resolvable") ? .resolvable : .storable
-                case "deleteRule":
-                    cfg.deleteRuleExpr = exprText
-                case "inverse":
-                    cfg.inverseExpr = exprText
-                default:
-                    break
-                }
-            }
-        }
-        return (attr, cfg)
-    }
-    return nil
 }
 
 private enum ContainerKind { case single, optional, array, arrayOptional, set, setOptional }
@@ -405,19 +417,8 @@ private func analyzeRelationshipType(_ typeText: String) -> RelationshipTypeInfo
 }
 
 private func mapRelatedType(_ info: RelationshipTypeInfo, suffix: String) -> String {
-    func attach(_ base: String) -> String {
-        if base.hasSuffix(".Definition") || base.hasSuffix(".Instance") || base.hasSuffix(".Override") { return base }
-        return "\(base).\(suffix)"
-    }
-    let mappedBase = attach(info.base)
-    switch info.container {
-    case .single:         return mappedBase
-    case .optional:       return "\(mappedBase)?"
-    case .array:          return "[\(mappedBase)]"
-    case .arrayOptional:  return "[\(mappedBase)]?"
-    case .set:            return "Set<\(mappedBase)>"
-    case .setOptional:    return "Set<\(mappedBase)>?"
-    }
+    let mappedBase = "\(info.base).\(suffix)"
+    return applyContainer(info.container, to: mappedBase)
 }
 
 private func rewriteInverseKeyPathToDefinition(_ raw: String) -> String {
@@ -426,13 +427,14 @@ private func rewriteInverseKeyPathToDefinition(_ raw: String) -> String {
     if s.contains(".Definition.") { return s }
     let noSlash = String(s.dropFirst())
     var parts = noSlash.split(separator: ".").map(String.init)
-    if let idx = parts.firstIndex(where: { guard let c = $0.first else { return false }; return c.isLowercase }) {
+    if let idx = parts.firstIndex(where: { $0.first?.isLowercase == true }) {
         if idx > 0 { parts.insert("Definition", at: idx) }
     } else {
         parts.append("Definition")
     }
     return "\\" + parts.joined(separator: ".")
 }
+
 
 // MARK: - Diagnostics
 
