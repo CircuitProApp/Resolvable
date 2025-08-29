@@ -203,30 +203,88 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         """)
     }
 
-    private static func createInstanceClass(instProps: [Prop], relDecls: [String], relInitParams: [String]) -> DeclSyntax {
+    private static func createInstanceClass(instProps: [Prop],
+                                            relDecls: [String],
+                                            relInitParams: [String]) -> DeclSyntax {
+        // 1) Build the declarations block
         let propsBlock = instProps.map { "var \($0.name): \($0.type)" }.joined(separator: "\n\n    ")
         let relBlock = relDecls.joined(separator: "\n\n    ")
+        let bodyMembers = [propsBlock, relBlock]
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .joined(separator: "\n\n    ")
 
-        // The public init now takes a full Definition
-        let initParamsList = ["id: UUID = UUID()", "definition: Definition"] + instProps.map { "\($0.name): \($0.type)" } + relInitParams
-        let initParams = initParamsList.joined(separator: ", ")
-        
-        func names(from params: [String]) -> [String] { params.compactMap { $0.split(separator: ":").first?.trimmingCharacters(in: .whitespaces) } }
-        let assignsLines = ["self.id = id", "self.definition = definition", "self._definitionUUID = definition.uuid"] + instProps.map { "self.\($0.name) = \($0.name)" } + names(from: relInitParams).map { "self.\($0) = \($0)" }
-        let assigns = assignsLines.joined(separator: "\n        ")
+        // 2) Build a name->type map for all instance-side stored properties
+        //    - from @InstanceStored fields (instProps)
+        //    - from instance-side relation/Resolvable fields (relDecls: "var name: Type")
+        var propTypes: [(name: String, type: String)] = []
+        for p in instProps {
+            propTypes.append((name: p.name, type: p.type))
+        }
+        for line in relDecls {
+            if let parsed = parseVarDeclLine(line) {
+                propTypes.append(parsed)
+            }
+        }
 
-        // Define the CodingKeys to handle the private UUID
-        let allPropNames = instProps.map { $0.name } + names(from: relInitParams)
-        let codingKeyCases = ["id"] + allPropNames
+        // Stable order for coding and (de)coding
+        let propOrder = propTypes.map { $0.name }
+
+        // 3) CodingKeys enum (static, no dynamic stringValue keys)
+        let codingKeysCases = (["id"] + propOrder)
+            .map { "case \($0)" }
+            .joined(separator: "\n        ")
         let codingKeysEnum = """
         enum CodingKeys: String, CodingKey {
-            case \(codingKeyCases.joined(separator: ", "))
+            \(codingKeysCases)
             case _definitionUUID = "definitionUUID"
         }
         """
 
-        let bodyMembers = [propsBlock, relBlock].filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.joined(separator: "\n\n    ")
+        // 4) Public init parameters and assignments
+        let initParamsList = ["id: UUID = UUID()", "definition: Definition"]
+            + instProps.map { "\($0.name): \($0.type)" }
+            + relInitParams // already "name: Type" or "name: Type = default"
+        let initParams = initParamsList.joined(separator: ", ")
 
+        func names(from params: [String]) -> [String] {
+            params.compactMap {
+                $0.split(separator: ":").first?.trimmingCharacters(in: .whitespaces)
+            }
+        }
+        let relParamNames = names(from: relInitParams)
+        let assignsLines = [
+            "self.id = id",
+            "self.definition = definition",
+            "self._definitionUUID = definition.uuid"
+        ]
+        + instProps.map { "self.\($0.name) = \($0.name)" }
+        + relParamNames.map { "self.\($0) = \($0)" }
+
+        let assigns = assignsLines.joined(separator: "\n        ")
+
+        // 5) Generate decoding lines with explicit types, no use of `self` before init
+        let decodeLines: [String] = propTypes.map { entry in
+            let (base, isOpt) = unwrapOptionalType(entry.type)
+            let key = entry.name
+            if isOpt {
+                return "self.\(key) = try container.decodeIfPresent(\(base).self, forKey: .\(key))"
+            } else {
+                return "self.\(key) = try container.decode(\(entry.type).self, forKey: .\(key))"
+            }
+        }
+
+        // 6) Generate encoding lines (encodeIfPresent for optionals)
+        let encodeLines: [String] = propTypes.map { entry in
+            let (base, isOpt) = unwrapOptionalType(entry.type)
+            let key = entry.name
+            if isOpt {
+                return "try container.encodeIfPresent(self.\(key), forKey: .\(key))"
+            } else {
+                return "try container.encode(self.\(key), forKey: .\(key))"
+            }
+        }
+
+        // 7) Build class
         return DeclSyntax("""
         @Observable public final class Instance: Codable, Hashable, Identifiable {
             public var id: UUID
@@ -246,14 +304,14 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
                 let container = try decoder.container(keyedBy: CodingKeys.self)
                 self.id = try container.decode(UUID.self, forKey: .id)
                 self._definitionUUID = try container.decode(UUID.self, forKey: ._definitionUUID)
-                \(raw: allPropNames.map { "self.\($0) = try container.decode(type(of: self.\($0)), forKey: .init(stringValue: \"\($0)\")!)" }.joined(separator: "\n            "))
+                \(raw: decodeLines.joined(separator: "\n            "))
             }
 
             public func encode(to encoder: Encoder) throws {
                 var container = encoder.container(keyedBy: CodingKeys.self)
                 try container.encode(self.id, forKey: .id)
                 try container.encode(self._definitionUUID, forKey: ._definitionUUID)
-                \(raw: allPropNames.map { "try container.encode(self.\($0), forKey: .init(stringValue: \"\($0)\")!)" }.joined(separator: "\n            "))
+                \(raw: encodeLines.joined(separator: "\n            "))
             }
 
             public static func == (lhs: Instance, rhs: Instance) -> Bool { lhs.id == rhs.id }
@@ -335,6 +393,27 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         }
         return "\\" + parts.joined(separator: ".")
     }
+    
+    // Parse "var name: Type" into (name, type), tolerating leading/trailing spaces
+    private static func parseVarDeclLine(_ line: String) -> (name: String, type: String)? {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("var ") else { return nil }
+        let rest = trimmed.dropFirst(4) // after "var "
+        guard let colonIndex = rest.firstIndex(of: ":") else { return nil }
+        let name = String(rest[..<colonIndex]).trimmingCharacters(in: .whitespaces)
+        let typePart = String(rest[rest.index(after: colonIndex)...]).trimmingCharacters(in: .whitespaces)
+        return (name, typePart)
+    }
+
+    // For "Foo?" return ("Foo", true); otherwise return (type, false)
+    private static func unwrapOptionalType(_ type: String) -> (base: String, isOptional: Bool) {
+        let t = type.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.hasSuffix("?") {
+            let base = String(t.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (base, true)
+        }
+        return (t, false)
+    }
 }
 
 // MARK: - Diagnostics
@@ -359,3 +438,4 @@ extension SyntaxProtocol {
         self.description.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+
