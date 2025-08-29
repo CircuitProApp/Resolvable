@@ -29,7 +29,6 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         var defRelInitParams: [String] = []
         var instRelInitParams: [String] = []
 
-        // --- REPLACEMENT STARTS HERE ---
         for member in structDecl.memberBlock.members {
             guard let varDecl = member.decl.as(VariableDeclSyntax.self),
                   let binding = varDecl.bindings.first,
@@ -40,12 +39,10 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
 
             allInitParams.append((name: name, type: typeText))
 
-            // Check for the new @ResolvableProperty attribute
             if let resolvableAttr = findAttribute(named: "ResolvableProperty", in: varDecl.attributes) {
                 
                 guard let info = analyzeRelationshipType(typeText) else { continue }
                 
-                // Parse definition: .definition
                 if let defArg = findArgument(labeled: "definition", in: resolvableAttr),
                    let defTypeName = extractTypeName(from: defArg.expression) {
                     
@@ -54,7 +51,6 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
                     defRelInitParams.append("\(name): \(finalDefType)")
                 }
 
-                // Parse instance: [.override, .instance]
                 if let instArg = findArgument(labeled: "instance", in: resolvableAttr),
                    let arrayExpr = instArg.expression.as(ArrayExprSyntax.self) {
                     
@@ -64,23 +60,29 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
                         let suffix = instTypeName.split(separator: ".").last.map(String.init) ?? ""
                         let propertyName: String
                         
-                        if info.container == .array || info.container == .set {
-                             propertyName = "\(name)\(suffix)s" // Plural: textsOverrides
+                        let isCollection = info.container == .array || info.container == .set
+                        
+                        if isCollection {
+                             propertyName = "\(name)\(suffix)s"
                         } else {
-                             propertyName = "\(name)\(suffix)" // Singular: textOverride
+                             propertyName = "\(name)\(suffix)"
                         }
                         
-                        let finalInstType = applyContainer(info.container, to: instTypeName) + (info.container == .array || info.container == .set ? "" : "?")
+                        var finalInstType = applyContainer(info.container, to: instTypeName)
+                        if !isCollection {
+                            finalInstType += "?"
+                        }
+
+                        let defaultValue = isCollection ? "[]" : "nil"
 
                         instRelDecls.append("var \(propertyName): \(finalInstType)")
-                        instRelInitParams.append("\(propertyName): \(finalInstType) = nil")
+                        instRelInitParams.append("\(propertyName): \(finalInstType) = \(defaultValue)")
                     }
                 }
                 
-                continue // Move to next member
+                continue
             }
             
-            // Handle the simple @StorableRelationship
             if let relationshipAttr = findAttribute(named: "StorableRelationship", in: varDecl.attributes),
                let info = analyzeRelationshipType(typeText) {
                 
@@ -102,10 +104,9 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
                 defRelInitParams.append("\(name): \(defType)")
                 instRelInitParams.append("\(name): \(instType)")
 
-                continue // Move to next member
+                continue
             }
 
-            // Handle @DefinitionStored / @InstanceStored
             let markers = markersForAttributes(varDecl.attributes)
             if markers == .both {
                 context.diagnose(Diagnostic(
@@ -121,7 +122,6 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
                  props.append(Prop(name: name, type: typeText, inDefinition: inDef, inInstance: inInst))
             }
         }
-        // --- REPLACEMENT ENDS HERE ---
 
         let defProps = props.filter { $0.inDefinition }
         let instProps = props.filter { $0.inInstance }
@@ -142,8 +142,8 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
             relInitParams: instRelInitParams
         ))
         decls.append(createSourceEnum())
-        decls.append(createResolvedStruct(props: props, relations: instRelDecls))
-        decls.append(createResolverStruct(relations: instRelDecls))
+        decls.append(createResolvedStruct(baseName: baseName, props: props, relations: instRelDecls))
+        decls.append(createResolverStruct(baseName: baseName))
 
         return decls
     }
@@ -163,7 +163,7 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         return [attr]
     }
 
-    // MARK: - Generation (Updated createResolvedStruct and createResolverStruct)
+    // MARK: - Generation
 
     private static func createBlockingUnavailableInit(baseName: String,
                                                       propsInfo: [(name: String, type: String)]) -> DeclSyntax {
@@ -274,9 +274,9 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         }
         """)
     }
-
-    private static func createResolvedStruct(props: [Prop], relations: [String]) -> DeclSyntax {
-        let computedProps = props.map { p -> String in
+    
+    private static func createResolvedStruct(baseName: String, props: [Prop], relations: [String]) -> DeclSyntax {
+        var computedProps = props.map { p -> String in
             switch (p.inDefinition, p.inInstance) {
             case (true, false):
                 return "public var \(p.name): \(p.type) { definition.\(p.name) }"
@@ -285,10 +285,17 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
             default: return ""
             }
         }.joined(separator: "\n\n    ")
-        
-        // TODO: This part needs to be smarter based on the actual relations
-        // For now, it's a placeholder. The real logic will need the parsed relation info.
-        let resolvedRelations = "    // TODO: Generate resolved properties for relationships like 'texts'"
+
+        // TODO: This logic needs to be fully implemented to call the sub-resolvers.
+        let resolvedRelations = """
+            public var texts: [CircuitText.Resolved] {
+                return CircuitText.Resolver.resolve(
+                    definitions: definition.texts,
+                    overrides: instance.textsOverrides ?? [],
+                    instances: instance.textsInstances ?? []
+                )
+            }
+        """
 
         return DeclSyntax("""
         public struct Resolved: Identifiable, Hashable {
@@ -304,12 +311,9 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         """)
     }
 
-    private static func createResolverStruct(relations: [String]) -> DeclSyntax {
-        // TODO: The resolver needs to become much smarter. It must know how to
-        // combine overrides and instances for resolvable properties.
+    private static func createResolverStruct(baseName: String) -> DeclSyntax {
         let single = """
         public static func resolve(definition: Definition, instance: Instance) -> Resolved {
-            // TODO: This needs to pass resolved sub-properties to the Resolved init
             return Resolved(source: .instance(instanceID: instance.id), definition: definition, instance: instance)
         }
         """
@@ -356,7 +360,7 @@ private func extractTypeName(from expr: ExprSyntax) -> String? {
     if text.hasSuffix(".self") {
         return String(text.dropLast(5))
     }
-    return nil // Return nil if it's not a .self expression
+    return nil
 }
 
 private func applyContainer(_ container: ContainerKind, to baseType: String) -> String {
