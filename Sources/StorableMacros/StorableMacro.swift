@@ -269,13 +269,18 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
                     """
                 } else {
                     var resolverParams: [String] = []
-                    resolverParams.append("definition: definition.\(rel.name)")
+                    // Always pass a single-element array for the definition
+                    resolverParams.append("definitions: [definition.\(rel.name)]")
+                    // Pass an array (or empty) for overrides/instances depending on what was requested
                     if rel.instanceComponents.contains("Override") {
-                        resolverParams.append("override: instance.\(rel.name)Override")
+                        resolverParams.append("overrides: instance.\(rel.name)Override.map { [$0] } ?? []")
+                    }
+                    if rel.instanceComponents.contains("Instance") {
+                        resolverParams.append("instances: instance.\(rel.name)Instance.map { [$0] } ?? []")
                     }
                     return """
                     public var \(rel.name): \(resolvedType) {
-                        return \(rel.baseTypeName).Resolver.resolve(\(resolverParams.joined(separator: ", ")))
+                        return \(rel.baseTypeName).Resolver.resolve(\(resolverParams.joined(separator: ", "))).first!
                     }
                     """
                 }
