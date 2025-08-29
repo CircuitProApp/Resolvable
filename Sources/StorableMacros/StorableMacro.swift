@@ -156,9 +156,6 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
         decls.append(createBlockingUnavailableInit(baseName: baseName, propsInfo: allInitParams))
         decls.append(createDefinitionClass(defProps: defProps, relDecls: defRelDecls, relInitParams: defRelInitParams))
         decls.append(createInstanceClass(instProps: instProps, relDecls: instRelDecls, relInitParams: instRelInitParams))
-        decls.append(createSourceEnum())
-        decls.append(createResolvedStruct(props: props, relations: relations))
-        decls.append(createResolverStruct())
 
         return decls
     }
@@ -209,137 +206,58 @@ public struct StorableMacro: MemberMacro, MemberAttributeMacro {
     private static func createInstanceClass(instProps: [Prop], relDecls: [String], relInitParams: [String]) -> DeclSyntax {
         let propsBlock = instProps.map { "var \($0.name): \($0.type)" }.joined(separator: "\n\n    ")
         let relBlock = relDecls.joined(separator: "\n\n    ")
-        let initParamsList = ["id: UUID = UUID()", "definitionUUID: UUID"] + instProps.map { "\($0.name): \($0.type)" } + relInitParams
+
+        // The public init now takes a full Definition
+        let initParamsList = ["id: UUID = UUID()", "definition: Definition"] + instProps.map { "\($0.name): \($0.type)" } + relInitParams
         let initParams = initParamsList.joined(separator: ", ")
+        
         func names(from params: [String]) -> [String] { params.compactMap { $0.split(separator: ":").first?.trimmingCharacters(in: .whitespaces) } }
-        let assignsLines = ["self.id = id", "self.definitionUUID = definitionUUID"] + instProps.map { "self.\($0.name) = \($0.name)" } + names(from: relInitParams).map { "self.\($0) = \($0)" }
+        let assignsLines = ["self.id = id", "self.definition = definition", "self._definitionUUID = definition.uuid"] + instProps.map { "self.\($0.name) = \($0.name)" } + names(from: relInitParams).map { "self.\($0) = \($0)" }
         let assigns = assignsLines.joined(separator: "\n        ")
+
+        // Define the CodingKeys to handle the private UUID
+        let allPropNames = instProps.map { $0.name } + names(from: relInitParams)
+        let codingKeyCases = ["id"] + allPropNames
+        let codingKeysEnum = """
+        enum CodingKeys: String, CodingKey {
+            case \(codingKeyCases.joined(separator: ", "))
+            case _definitionUUID = "definitionUUID"
+        }
+        """
+
         let bodyMembers = [propsBlock, relBlock].filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.joined(separator: "\n\n    ")
+
         return DeclSyntax("""
         @Observable public final class Instance: Codable, Hashable, Identifiable {
             public var id: UUID
-            public var definitionUUID: UUID
+            @Transient public var definition: Definition? = nil
+            private var _definitionUUID: UUID
+            public var definitionUUID: UUID { definition?.uuid ?? _definitionUUID }
+
             \(raw: bodyMembers)
+
+            \(raw: codingKeysEnum)
+
             public init(\(raw: initParams)) {
                 \(raw: assigns)
             }
+
+            public required init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                self.id = try container.decode(UUID.self, forKey: .id)
+                self._definitionUUID = try container.decode(UUID.self, forKey: ._definitionUUID)
+                \(raw: allPropNames.map { "self.\($0) = try container.decode(type(of: self.\($0)), forKey: .init(stringValue: \"\($0)\")!)" }.joined(separator: "\n            "))
+            }
+
+            public func encode(to encoder: Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(self.id, forKey: .id)
+                try container.encode(self._definitionUUID, forKey: ._definitionUUID)
+                \(raw: allPropNames.map { "try container.encode(self.\($0), forKey: .init(stringValue: \"\($0)\")!)" }.joined(separator: "\n            "))
+            }
+
             public static func == (lhs: Instance, rhs: Instance) -> Bool { lhs.id == rhs.id }
             public func hash(into hasher: inout Hasher) { hasher.combine(id) }
-        }
-        """)
-    }
-
-    private static func createSourceEnum() -> DeclSyntax {
-        DeclSyntax("""
-        public enum Source: Hashable {
-            case definition(definitionUUID: UUID)
-            case instance(instanceID: UUID)
-        }
-        """)
-    }
-    
-    private static func createResolvedStruct(props: [Prop], relations: [RelationInfo]) -> DeclSyntax {
-        let computedProps = props.map { p -> String in
-            switch (p.inDefinition, p.inInstance) {
-            case (true, false):
-                return "public var \(p.name): \(p.type) { definition.\(p.name) }"
-            case (false, true):
-                return "public var \(p.name): \(p.type) { instance.\(p.name) }"
-            default: return ""
-            }
-        }.joined(separator: "\n\n    ")
-        
-        let resolvedRelations = relations.map { rel -> String in
-            let resolvedType = rel.isCollection ? "[\(rel.baseTypeName).Resolved]" : "\(rel.baseTypeName).Resolved"
-            
-            if rel.isResolvable {
-                if rel.isCollection {
-                    var resolverParams: [String] = []
-                    resolverParams.append("definitions: definition.\(rel.name)")
-                    if rel.instanceComponents.contains("Override") {
-                        resolverParams.append("overrides: instance.\(rel.name)Overrides")
-                    }
-                    if rel.instanceComponents.contains("Instance") {
-                        resolverParams.append("instances: instance.\(rel.name)Instances")
-                    }
-                    return """
-                    public var \(rel.name): \(resolvedType) {
-                        return \(rel.baseTypeName).Resolver.resolve(\(resolverParams.joined(separator: ", ")))
-                    }
-                    """
-                } else {
-                    var resolverParams: [String] = []
-                    // Always pass a single-element array for the definition
-                    resolverParams.append("definitions: [definition.\(rel.name)]")
-                    // Pass an array (or empty) for overrides/instances depending on what was requested
-                    if rel.instanceComponents.contains("Override") {
-                        resolverParams.append("overrides: instance.\(rel.name)Override.map { [$0] } ?? []")
-                    }
-                    if rel.instanceComponents.contains("Instance") {
-                        resolverParams.append("instances: instance.\(rel.name)Instance.map { [$0] } ?? []")
-                    }
-                    return """
-                    public var \(rel.name): \(resolvedType) {
-                        return \(rel.baseTypeName).Resolver.resolve(\(resolverParams.joined(separator: ", "))).first!
-                    }
-                    """
-                }
-            } else {
-                if rel.isCollection {
-                    return """
-                    public var \(rel.name): \(resolvedType) {
-                        let defs = definition.\(rel.name)
-                        let insts = instance.\(rel.name)
-                        return zip(defs, insts).map { (def, inst) in
-                            \(rel.baseTypeName).Resolver.resolve(definition: def, instance: inst)
-                        }
-                    }
-                    """
-                } else {
-                    return """
-                    public var \(rel.name): \(resolvedType) {
-                        return \(rel.baseTypeName).Resolver.resolve(definition: definition.\(rel.name), instance: instance.\(rel.name))
-                    }
-                    """
-                }
-            }
-        }.joined(separator: "\n\n    ")
-
-        return DeclSyntax("""
-        public struct Resolved: Identifiable, Hashable {
-            public var id: UUID { instance.id }
-            public let source: Source
-            public let definition: Definition
-            public let instance: Instance
-
-            \(raw: computedProps)
-            
-            \(raw: resolvedRelations)
-        }
-        """)
-    }
-
-    private static func createResolverStruct() -> DeclSyntax {
-        let single = """
-        public static func resolve(definition: Definition, instance: Instance) -> Resolved {
-            return Resolved(source: .instance(instanceID: instance.id), definition: definition, instance: instance)
-        }
-        """
-        let batch = """
-        public static func resolve(definitions: [Definition], instances: [Instance]) -> [Resolved] {
-            let instancesByDefUUID = Dictionary(grouping: instances, by: { $0.definitionUUID })
-            return definitions.compactMap { def in
-                guard let inst = instancesByDefUUID[def.uuid]?.first else {
-                    return nil
-                }
-                return resolve(definition: def, instance: inst)
-            }
-        }
-        """
-        return DeclSyntax("""
-        public struct Resolver {
-            \(raw: single)
-            \(raw: batch)
         }
         """)
     }
