@@ -31,7 +31,7 @@ public enum ResolvablePattern {
 @attached(memberAttribute)
 public macro Resolvable(
     default: ResolvableDefault = .identity,
-    generate: ResolvablePattern = .full
+    pattern: ResolvablePattern = .full
 ) = #externalMacro(module: "ResolvableMacros", type: "ResolvableMacro")
 
 /// A property wrapper to mark which properties of a model can be
