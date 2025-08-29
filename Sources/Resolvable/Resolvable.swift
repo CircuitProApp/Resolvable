@@ -7,16 +7,13 @@ public enum ResolvableDefault {
     case overridable   // All properties are overridable unless marked @Identity
 }
 
-/// Which nested types the @Resolvable macro should generate.
-public struct ResolvableParts: OptionSet, Hashable, Codable, Sendable {
-    public let rawValue: UInt8
-    public init(rawValue: UInt8) { self.rawValue = rawValue }
+/// Defines the pattern of code generation for a @Resolvable type.
+public enum ResolvablePattern {
+    /// Generates `.Definition`, `.Instance`, and `.Override`.
+    case full
 
-    public static let definition = ResolvableParts(rawValue: 1 << 0)
-    public static let instance   = ResolvableParts(rawValue: 1 << 1)
-    public static let overrides  = ResolvableParts(rawValue: 1 << 2)
-
-    public static let all: ResolvableParts = [.definition, .instance, .overrides]
+    /// Generates only `.Definition` and `.Override`.
+    case nonInstantiable
 }
 
 /// The `@Resolvable` macro generates all the necessary boilerplate for the
@@ -35,7 +32,7 @@ public struct ResolvableParts: OptionSet, Hashable, Codable, Sendable {
 @attached(memberAttribute)
 public macro Resolvable(
     default: ResolvableDefault = .optIn,
-    generate: ResolvableParts = .all
+    pattern: ResolvablePattern = .full
 ) = #externalMacro(module: "ResolvableMacros", type: "ResolvableMacro")
 
 /// A property wrapper to mark which properties of a model can be

@@ -13,14 +13,16 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
     }
 
     // Generate flags parsed from `generate:` option set
+    private enum ResolvablePattern {
+        case full
+        case nonInstantiable
+    }
+    
     private struct GenerateFlags {
-        var hasDefinition = true
-        var hasInstance   = true
-        // Whether override fields should be generated + applied.
-        // The Override type still exists whenever hasDefinition is true.
-        var includeOverrideFields = true
-
-        var hasAnySource: Bool { hasDefinition || hasInstance }
+        var hasDefinition: Bool
+        var hasInstance: Bool
+        // This can be simplified. If a definition exists, overrides should be included.
+        var includeOverrideFields: Bool
     }
 
     public static func expansion(
@@ -43,31 +45,15 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             }
         }
 
-        // Parse @Resolvable(generate: <ResolvableParts>)
-        let generateFlags = parseGenerateFlags(from: node)
+         let pattern = parsePattern(from: node)
 
-        // If nothing to resolve from
-        if !generateFlags.hasAnySource {
-            context.diagnose(Diagnostic(
-                node: Syntax(node),
-                message: ResolvableMessage(
-                    id: "noSourcesSelected",
-                    message: "At least one of '.definition' or '.instance' must be included in 'generate:' to produce 'Source', 'Resolved', and 'Resolver'.",
-                    severity: .error
-                )
-            ))
-        }
-        // If override fields requested but no definitions exist
-        if generateFlags.includeOverrideFields && !generateFlags.hasDefinition {
-            context.diagnose(Diagnostic(
-                node: Syntax(node),
-                message: ResolvableMessage(
-                    id: "overridesWithoutDefinition",
-                    message: "'.overrides' has no effect without '.definition'. The resolver will ignore overrides.",
-                    severity: .warning
-                )
-            ))
-        }
+         let generateFlags: GenerateFlags
+         switch pattern {
+         case .full:
+             generateFlags = GenerateFlags(hasDefinition: true, hasInstance: true, includeOverrideFields: true)
+         case .nonInstantiable:
+             generateFlags = GenerateFlags(hasDefinition: true, hasInstance: false, includeOverrideFields: true)
+         }
 
         var allProperties: [VariableDeclSyntax] = []
         var fullOverrides: [VariableDeclSyntax] = []
@@ -217,7 +203,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             decls.append(createInstanceStruct(baseName: baseName, properties: allProperties))
         }
 
-        if generateFlags.hasAnySource {
+        if generateFlags.hasDefinition || generateFlags.hasInstance {
             decls.append(createSourceEnum(baseName: baseName,
                                           hasDefinition: generateFlags.hasDefinition,
                                           hasInstance: generateFlags.hasInstance))
@@ -519,30 +505,21 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         }
         return text
     }
-
-    // Parse generate flags from the attribute's `generate:` argument.
-    private static func parseGenerateFlags(from node: AttributeSyntax) -> GenerateFlags {
-        var flags = GenerateFlags() // default == .all
+    
+    private static func parsePattern(from node: AttributeSyntax) -> ResolvablePattern {
         guard let args = node.arguments?.as(LabeledExprListSyntax.self),
-              let generateArg = args.first(where: { $0.label?.text == "generate" })
-        else { return flags }
-
-        let text = generateArg.expression.trimmedDescription
-
-        if text.contains(".all") {
-            return flags
+              let patternArg = args.first(where: { $0.label?.text == "pattern" })
+        else {
+            // If the `pattern` argument is omitted, default to `.full`.
+            return .full
         }
 
-        // Reset and enable selectively
-        flags.hasDefinition = false
-        flags.hasInstance = false
-        flags.includeOverrideFields = false
+        let text = patternArg.expression.trimmedDescription
+        if text.contains("nonInstantiable") {
+            return .nonInstantiable
+        }
 
-        if text.contains(".definition") { flags.hasDefinition = true }
-        if text.contains(".instance")   { flags.hasInstance = true }
-        if text.contains(".overrides")  { flags.includeOverrideFields = true }
-
-        return flags
+        return .full
     }
 }
 
