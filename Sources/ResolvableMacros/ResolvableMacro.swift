@@ -5,18 +5,18 @@ import SwiftSyntaxMacros
 import SwiftDiagnostics
 
 public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
-
+    
     // MARK: - API Configuration Enums
     public enum ResolvablePattern {
         case full
         case nonInstantiable
     }
-
+    
     private enum ResolvableDefault {
         case identity
         case overridable
     }
-
+    
     // MARK: - Internal State
     private struct GenerateFlags {
         var hasDefinition: Bool
@@ -24,7 +24,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         // This can be simplified. If a definition exists, overrides should be included.
         var includeOverrideFields: Bool
     }
-
+    
     // MARK: - Main Expansion
     public static func expansion(
         of node: AttributeSyntax,
@@ -45,28 +45,28 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         case .nonInstantiable:
             generateFlags = GenerateFlags(hasDefinition: true, hasInstance: false, includeOverrideFields: true)
         }
-
+        
         var defaultBehavior: ResolvableDefault = .identity
         if let args = node.arguments?.as(LabeledExprListSyntax.self),
            let defaultArg = args.first(where: { $0.label?.text == "default" }) {
             let text = defaultArg.expression.description.trimmingCharacters(in: .whitespacesAndNewlines)
             if text.contains("overridable") { defaultBehavior = .overridable }
         }
-
+        
         var allProperties: [VariableDeclSyntax] = []
         var fullOverrides: [VariableDeclSyntax] = []
         var nestedOverrides: [String: [(leafName: String, leafType: String)]] = [:]
-
+        
         for member in structDecl.memberBlock.members {
             guard let varDecl = member.decl.as(VariableDeclSyntax.self),
                   let binding = varDecl.bindings.first,
                   binding.accessorBlock == nil
             else { continue }
-
+            
             let overridableAttr = varDecl.attributes.first {
                 $0.as(AttributeSyntax.self)?.attributeName.description.trimmingCharacters(in: .whitespacesAndNewlines) == "Overridable"
             }?.as(AttributeSyntax.self)
-
+            
             let hasIdentity = varDecl.attributes.contains {
                 $0.as(AttributeSyntax.self)?.attributeName.description.trimmingCharacters(in: .whitespacesAndNewlines) == "Identity"
             }
@@ -83,10 +83,10 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             }
             cleanedVarDecl.attributes = AttributeListSyntax(filtered)
             allProperties.append(cleanedVarDecl)
-
+            
             let isOverridable = (hasOverridable || defaultBehavior == .overridable) && !hasIdentity
             guard isOverridable else { continue }
-
+            
             guard let propName = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text, !propName.isEmpty else { continue }
             
             guard let attr = overridableAttr, let args = attr.arguments?.as(LabeledExprListSyntax.self), !args.isEmpty else {
@@ -101,10 +101,10 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             guard let leafTypeText = asExpr.flatMap(Self.extractTypeName(from:)), !leafTypeText.isEmpty else { continue }
             nestedOverrides[propName, default: []].append((leafName: leafName, leafType: leafTypeText))
         }
-
+        
         var decls: [DeclSyntax] = []
         decls.append(createBlockingUnavailableInit(baseName: baseName, properties: allProperties))
-
+        
         if generateFlags.hasDefinition {
             decls.append(createDefinitionStruct(properties: allProperties))
             decls.append(createOverrideStruct(fullOverrides: fullOverrides,
@@ -114,7 +114,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         if generateFlags.hasInstance {
             decls.append(createInstanceStruct(properties: allProperties))
         }
-
+        
         if generateFlags.hasDefinition || generateFlags.hasInstance {
             decls.append(createSourceEnum(hasDefinition: generateFlags.hasDefinition, hasInstance: generateFlags.hasInstance))
             decls.append(createResolvedStruct(properties: allProperties,
@@ -128,7 +128,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         }
         return decls
     }
-
+    
     public static func expansion(
         of node: AttributeSyntax,
         attachedTo declaration: some DeclGroupSyntax,
@@ -140,7 +140,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         let attr: AttributeSyntax = "@available(*, unavailable, message: \"Do not instantiate \(raw: baseName) directly. Use nested types instead.\")"
         return [attr]
     }
-
+    
     // MARK: - Generation
     private static func createBlockingUnavailableInit(baseName: String, properties: [VariableDeclSyntax]) -> DeclSyntax {
         let params = properties.compactMap { p -> String? in
@@ -150,13 +150,13 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             else { return nil }
             return "\(n): \(t)"
         }.joined(separator: ", ")
-
+        
         return """
         @available(*, unavailable, message: "Do not instantiate '\(raw: baseName)'. Use nested types instead.")
         public init(\(raw: params)) { fatalError("This initializer cannot be called.") }
         """
     }
-
+    
     private static func createDefinitionStruct(properties: [VariableDeclSyntax]) -> DeclSyntax {
         let props = properties.map { $0.description }.joined(separator: "\n\n    ")
         return """
@@ -166,7 +166,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         }
         """
     }
-
+    
     private static func createInstanceStruct(properties: [VariableDeclSyntax]) -> DeclSyntax {
         let props = properties.map { $0.description }.joined(separator: "\n\n    ")
         return """
@@ -176,7 +176,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         }
         """
     }
-
+    
     private static func createOverrideStruct(fullOverrides: [VariableDeclSyntax], nestedOverrides: [String: [(leafName: String, leafType: String)]], includeFields: Bool) -> DeclSyntax {
         var fields: [String] = []
         if includeFields {
@@ -243,7 +243,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         }
         """
     }
-
+    
     private static func createResolverStruct(allProperties: [VariableDeclSyntax],
                                              fullOverrides: [VariableDeclSyntax],
                                              nestedOverrides: [String: [(leafName: String, leafType: String)]],
@@ -253,9 +253,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         
         let fullOverrideSet = Set(fullOverrides.compactMap { $0.bindings.first?.pattern.as(IdentifierPatternSyntax.self)?.identifier.text })
         let nestedOverrideSet = Set(nestedOverrides.keys)
-
-        // --- CORRECTED LOGIC FOR ARGS ---
-        // This closure now correctly uses `def` as the variable name.
+        
         let resolvedFromDefArgs = allProperties.map { p -> String in
             guard let n = p.bindings.first?.pattern.as(IdentifierPatternSyntax.self)?.identifier.text else { return "" }
             
@@ -266,22 +264,71 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
                     "if let v = override?.\(n)_\($0.leafName) { value.\($0.leafName) = v }"
                 }.joined(separator: "\n                ")
                 return """
-                \(n): {
-                        var value = def.\(n)
-                        \(mutations)
-                        return value
-                    }()
-                """
+            \(n): {
+                    var value = def.\(n)
+                    \(mutations)
+                    return value
+                }()
+            """
             } else {
                 return "\(n): def.\(n)"
             }
         }.joined(separator: ",\n                ")
-
+        
         let resolvedFromInstArgs = allProperties.compactMap { p -> String? in
             guard let n = p.bindings.first?.pattern.as(IdentifierPatternSyntax.self)?.identifier.text else { return nil }
             return "\(n): inst.\(n)"
         }.joined(separator: ",\n                         ")
         
+        // Helpers (private)
+        let helperFromDef = hasDefinition ? """
+    private static func _resolve(def: Definition, override: Override?) -> Resolved {
+        return Resolved(
+            source: .definition(definition: def),
+            \(resolvedFromDefArgs)
+        )
+    }
+    """ : ""
+        
+        let helperFromInst = hasInstance ? """
+    private static func _resolve(inst: Instance) -> Resolved {
+        return Resolved(
+            source: .instance(instance: inst),
+            \(resolvedFromInstArgs)
+        )
+    }
+    """ : ""
+        
+        // Scalar overloads
+        let scalarFromDef = hasDefinition ? """
+    public static func resolve(definition: Definition, override: Override? = nil) -> Resolved {
+        _resolve(def: definition, override: override)
+    }
+    """ : ""
+        
+        let scalarFromInst = hasInstance ? """
+    public static func resolve(instance: Instance) -> Resolved {
+        _resolve(inst: instance)
+    }
+    """ : ""
+        
+        // Array overloads
+        let arrayFromDefs = hasDefinition ? """
+    public static func resolve(definitions: [Definition], overrides: [Override] = []) -> [Resolved] {
+        let overrideDict = Dictionary(uniqueKeysWithValues: overrides.map { ($0.definitionID, $0) })
+        return definitions.map { def in
+            _resolve(def: def, override: overrideDict[def.id])
+        }
+    }
+    """ : ""
+        
+        let arrayFromInsts = hasInstance ? """
+    public static func resolve(instances: [Instance]) -> [Resolved] {
+        return instances.map { _resolve(inst: $0) }
+    }
+    """ : ""
+        
+        // Combined entry point (kept for compatibility)
         var params: [String] = []
         if hasDefinition { params.append("definitions: [Definition] = []") }
         if hasDefinition { params.append("overrides: [Override] = []") }
@@ -289,29 +336,29 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         
         var body: [String] = []
         var returnStatement: String = ""
-
+        
         if hasDefinition {
             body.append("let overrideDict = Dictionary(uniqueKeysWithValues: overrides.map { ($0.definitionID, $0) })")
             body.append("""
-            let fromDefs = definitions.map { def -> Resolved in
-                let override = overrideDict[def.id]
-                return Resolved(
-                    source: .definition(definition: def),
-                    \(resolvedFromDefArgs)
-                )
-            }
-            """)
+        let fromDefs = definitions.map { def -> Resolved in
+            let override = overrideDict[def.id]
+            return Resolved(
+                source: .definition(definition: def),
+                \(resolvedFromDefArgs)
+            )
+        }
+        """)
         }
         
         if hasInstance {
             body.append("""
-            let fromInsts = instances.map { inst -> Resolved in
-                return Resolved(
-                    source: .instance(instance: inst),
-                    \(resolvedFromInstArgs)
-                )
-            }
-            """)
+        let fromInsts = instances.map { inst -> Resolved in
+            return Resolved(
+                source: .instance(instance: inst),
+                \(resolvedFromInstArgs)
+            )
+        }
+        """)
         }
         
         switch (hasDefinition, hasInstance) {
@@ -322,19 +369,27 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         }
         
         let mainResolver = """
-        public static func resolve(\(params.joined(separator: ", "))) -> [Resolved] {
-            \(body.joined(separator: "\n        "))
-            \(returnStatement)
-        }
-        """
-
-        return """
-        public struct Resolver {
-            \(raw: mainResolver)
-        }
-        """
+    public static func resolve(\(params.joined(separator: ", "))) -> [Resolved] {
+        \(body.joined(separator: "\n        "))
+        \(returnStatement)
     }
-
+    """
+        
+        return """
+    public struct Resolver {
+        \(raw: helperFromDef.isEmpty ? "" : helperFromDef + "\n\n    ")
+        \(raw: helperFromInst.isEmpty ? "" : helperFromInst + "\n\n    ")
+        \(raw: scalarFromDef.isEmpty ? "" : scalarFromDef + "\n\n    ")
+        \(raw: scalarFromInst.isEmpty ? "" : scalarFromInst + "\n\n    ")
+        \(raw: arrayFromDefs.isEmpty ? "" : arrayFromDefs + "\n\n    ")
+        \(raw: arrayFromInsts.isEmpty ? "" : arrayFromInsts + "\n\n    ")
+        \(raw: mainResolver)
+    }
+    """
+    }
+    
+    
+    
     // MARK: - Helper Functions
     private static func parsePattern(from node: AttributeSyntax) -> ResolvablePattern {
         guard let args = node.arguments?.as(LabeledExprListSyntax.self),
