@@ -53,16 +53,6 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             if text.contains("overridable") { defaultBehavior = .overridable }
         }
 
-         let pattern = parsePattern(from: node)
-
-         let generateFlags: GenerateFlags
-         switch pattern {
-         case .full:
-             generateFlags = GenerateFlags(hasDefinition: true, hasInstance: true, includeOverrideFields: true)
-         case .nonInstantiable:
-             generateFlags = GenerateFlags(hasDefinition: true, hasInstance: false, includeOverrideFields: true)
-         }
-
         var allProperties: [VariableDeclSyntax] = []
         var fullOverrides: [VariableDeclSyntax] = []
         var nestedOverrides: [String: [(leafName: String, leafType: String)]] = [:]
@@ -360,22 +350,6 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         let text = expr.description.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasSuffix(".self") { return String(text.dropLast(5)) }
         return text
-    }
-    
-    private static func parsePattern(from node: AttributeSyntax) -> ResolvablePattern {
-        guard let args = node.arguments?.as(LabeledExprListSyntax.self),
-              let patternArg = args.first(where: { $0.label?.text == "pattern" })
-        else {
-            // If the `pattern` argument is omitted, default to `.full`.
-            return .full
-        }
-
-        let text = patternArg.expression.trimmedDescription
-        if text.contains("nonInstantiable") {
-            return .nonInstantiable
-        }
-
-        return .full
     }
 }
 
