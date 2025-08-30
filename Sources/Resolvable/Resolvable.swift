@@ -3,7 +3,7 @@
 
 // Default behavior for properties inside a @Resolvable struct
 public enum ResolvableDefault {
-    case optIn         // Only properties marked @Overridable are overridable
+    case identity         // Only properties marked @Overridable are overridable
     case overridable   // All properties are overridable unless marked @Identity
 }
 
@@ -31,7 +31,7 @@ public enum ResolvablePattern {
 )
 @attached(memberAttribute)
 public macro Resolvable(
-    default: ResolvableDefault = .optIn,
+    default: ResolvableDefault = .identity,
     pattern: ResolvablePattern = .full
 ) = #externalMacro(module: "ResolvableMacros", type: "ResolvableMacro")
 
