@@ -4,7 +4,7 @@
 // Default behavior for properties inside a @Resolvable struct
 public enum ResolvableDefault {
     case identity         // Only properties marked @Overridable are overridable
-    case overridable   // All properties are overridable unless marked @Identity
+    case overridable      // All properties are overridable unless marked @Identity
 }
 
 /// Defines the pattern of code generation for a @Resolvable type.
@@ -29,6 +29,7 @@ public enum ResolvablePattern {
         named(Resolver),
         named(init)
 )
+@attached(extension, conformances: Resolvable)
 @attached(memberAttribute)
 public macro Resolvable(
     default: ResolvableDefault = .identity,

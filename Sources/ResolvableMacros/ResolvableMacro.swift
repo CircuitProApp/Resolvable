@@ -4,28 +4,58 @@ import SwiftSyntaxBuilder
 import SwiftSyntaxMacros
 import SwiftDiagnostics
 
-public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
-    
+public struct ResolvableMacro: MemberMacro, MemberAttributeMacro, ExtensionMacro {
+
     // MARK: - API Configuration Enums
     public enum ResolvablePattern {
         case full
         case nonInstantiable
     }
-    
+
     private enum ResolvableDefault {
         case identity
         case overridable
     }
-    
+
     // MARK: - Internal State
     private struct GenerateFlags {
         var hasDefinition: Bool
         var hasInstance: Bool
-        // This can be simplified. If a definition exists, overrides should be included.
         var includeOverrideFields: Bool
     }
-    
-    // MARK: - Main Expansion
+
+    // MARK: - Extension conformance generation
+    // Emits: extension <Base>: Resolvable { typealias ... }
+    // Only when pattern == .full (Instance exists).
+    public static func expansion(
+        of node: AttributeSyntax,
+        attachedTo declaration: some DeclGroupSyntax,
+        providingExtensionsOf type: some TypeSyntaxProtocol,
+        conformingTo protocols: [TypeSyntax],
+        in context: some MacroExpansionContext
+    ) throws -> [ExtensionDeclSyntax] {
+        // Only attach to structs annotated with @Resolvable
+        guard declaration.is(StructDeclSyntax.self) else { return [] }
+
+        // Respect the pattern: only add Resolvable conformance in `.full`
+        let pattern = parsePattern(from: node)
+        guard pattern == .full else { return [] }
+
+        // Build: extension <Base>: Resolvable {}
+        let inheritance = InheritanceClauseSyntax {
+            InheritedTypeSyntax(type: IdentifierTypeSyntax(name: .identifier("Resolvable")))
+        }
+
+        let ext = ExtensionDeclSyntax(
+            extendedType: type.trimmed,
+            inheritanceClause: inheritance,
+            memberBlock: MemberBlockSyntax(members: MemberBlockItemListSyntax([]))
+        )
+
+        return [ext]
+    }
+
+    // MARK: - Member generation
     public static func expansion(
         of node: AttributeSyntax,
         providingMembersOf declaration: some DeclGroupSyntax,
@@ -35,9 +65,9 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             return []
         }
         let baseName = structDecl.name.text
-        
+
         let pattern = parsePattern(from: node)
-        
+
         let generateFlags: GenerateFlags
         switch pattern {
         case .full:
@@ -53,49 +83,42 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
                 includeOverrideFields: true
             )
         }
-        
+
         var defaultBehavior: ResolvableDefault = .identity
         if let args = node.arguments?.as(LabeledExprListSyntax.self),
            let defaultArg = args.first(where: { $0.label?.text == "default" }) {
-            let text = defaultArg.expression.description.trimmingCharacters(
-                in: .whitespacesAndNewlines
-            )
+            let text = defaultArg.expression.description.trimmingCharacters(in: .whitespacesAndNewlines)
             if text.contains("overridable") { defaultBehavior = .overridable }
         }
-        
+
         var allProperties: [VariableDeclSyntax] = []
         var fullOverrides: [VariableDeclSyntax] = []
         var nestedOverrides: [String: [(leafName: String, leafType: String)]] = [:]
-        
+
         for member in structDecl.memberBlock.members {
             guard let varDecl = member.decl.as(VariableDeclSyntax.self),
                   let binding = varDecl.bindings.first,
                   binding.accessorBlock == nil
             else { continue }
-            
+
             let overridableAttr = varDecl.attributes.first {
-                $0
-                    .as(AttributeSyntax.self)?.attributeName.description
-                    .trimmingCharacters(
-                        in: .whitespacesAndNewlines
-                    ) == "Overridable"
+                $0.as(AttributeSyntax.self)?
+                    .attributeName.description
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == "Overridable"
             }?.as(AttributeSyntax.self)
-            
+
             let hasIdentity = varDecl.attributes.contains {
-                $0
-                    .as(AttributeSyntax.self)?.attributeName.description
-                    .trimmingCharacters(
-                        in: .whitespacesAndNewlines
-                    ) == "Identity"
+                $0.as(AttributeSyntax.self)?
+                    .attributeName.description
+                    .trimmingCharacters(in: .whitespacesAndNewlines) == "Identity"
             }
             let hasOverridable = (overridableAttr != nil)
-            
+
+            // Strip marker attributes from the property as they are compile-time only.
             var cleanedVarDecl = varDecl
             let filtered = varDecl.attributes.compactMap { elem -> AttributeListSyntax.Element? in
                 if let attr = elem.as(AttributeSyntax.self),
-                   let name = attr.attributeName.as(
-                    IdentifierTypeSyntax.self
-                   )?.name.text,
+                   let name = attr.attributeName.as(IdentifierTypeSyntax.self)?.name.text,
                    name == "Overridable" || name == "Identity" {
                     return nil
                 }
@@ -103,77 +126,77 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
             }
             cleanedVarDecl.attributes = AttributeListSyntax(filtered)
             allProperties.append(cleanedVarDecl)
-            
-            let isOverridable = (
-                hasOverridable || defaultBehavior == .overridable
-            ) && !hasIdentity
+
+            let isOverridable = (hasOverridable || defaultBehavior == .overridable) && !hasIdentity
             guard isOverridable else { continue }
-            
+
             guard let propName = binding.pattern.as(IdentifierPatternSyntax.self)?.identifier.text, !propName.isEmpty else {
                 continue
             }
-            
-            guard let attr = overridableAttr, let args = attr.arguments?.as(LabeledExprListSyntax.self), !args.isEmpty else {
+
+            // Full-field override (no arguments)
+            guard let attr = overridableAttr,
+                  let args = attr.arguments?.as(LabeledExprListSyntax.self),
+                  !args.isEmpty
+            else {
                 fullOverrides.append(cleanedVarDecl)
                 continue
             }
-            
-            let keyPathExpr = args.lazy.compactMap {
-                $0.expression.as(KeyPathExprSyntax.self)
-            }.first
+
+            // Nested override: @Overridable(\Parent.leaf, as: LeafType.self)
+            let keyPathExpr = args.lazy.compactMap { $0.expression.as(KeyPathExprSyntax.self) }.first
             guard let kp = keyPathExpr else { continue }
-            guard let leafName = kp.lastComponentName, !leafName.isEmpty else {
-                continue
-            }
-            let asExpr = args.first(
-                where: { $0.label?.text == "as"
-                })?.expression
-            guard let leafTypeText = asExpr.flatMap(Self.extractTypeName(from:)), !leafTypeText.isEmpty else {
-                continue
-            }
+            guard let leafName = kp.lastComponentName, !leafName.isEmpty else { continue }
+
+            let asExpr = args.first(where: { $0.label?.text == "as" })?.expression
+            guard let leafTypeText = asExpr.flatMap(Self.extractTypeName(from:)), !leafTypeText.isEmpty else { continue }
+
             nestedOverrides[propName, default: []]
                 .append((leafName: leafName, leafType: leafTypeText))
         }
-        
+
         var decls: [DeclSyntax] = []
-        decls
-            .append(
-                createBlockingUnavailableInit(
-                    baseName: baseName,
-                    properties: allProperties
-                )
-            )
-        
+        decls.append(createBlockingUnavailableInit(baseName: baseName, properties: allProperties))
+
         if generateFlags.hasDefinition {
             decls.append(createDefinitionStruct(properties: allProperties))
-            decls.append(createOverrideStruct(fullOverrides: fullOverrides,
-                                              nestedOverrides: nestedOverrides,
-                                              includeFields: generateFlags.includeOverrideFields))
+            decls.append(
+                createOverrideStruct(
+                    baseName: baseName,
+                    fullOverrides: fullOverrides,
+                    nestedOverrides: nestedOverrides,
+                    includeFields: generateFlags.includeOverrideFields
+                )
+            )
         }
         if generateFlags.hasInstance {
             decls.append(createInstanceStruct(properties: allProperties))
         }
-        
+
         if generateFlags.hasDefinition || generateFlags.hasInstance {
-            decls
-                .append(
-                    createSourceEnum(
-                        hasDefinition: generateFlags.hasDefinition,
-                        hasInstance: generateFlags.hasInstance
-                    )
+            decls.append(createSourceEnum(hasDefinition: generateFlags.hasDefinition, hasInstance: generateFlags.hasInstance))
+            decls.append(
+                createResolvedStruct(
+                    baseName: baseName,
+                    properties: allProperties,
+                    hasDefinition: generateFlags.hasDefinition,
+                    hasInstance: generateFlags.hasInstance
                 )
-            decls.append(createResolvedStruct(properties: allProperties,
-                                              hasDefinition: generateFlags.hasDefinition,
-                                              hasInstance: generateFlags.hasInstance))
-            decls.append(createResolverStruct(allProperties: allProperties,
-                                              fullOverrides: fullOverrides,
-                                              nestedOverrides: nestedOverrides,
-                                              hasDefinition: generateFlags.hasDefinition,
-                                              hasInstance: generateFlags.hasInstance))
+            )
+            decls.append(
+                createResolverStruct(
+                    baseName: baseName,
+                    allProperties: allProperties,
+                    fullOverrides: fullOverrides,
+                    nestedOverrides: nestedOverrides,
+                    hasDefinition: generateFlags.hasDefinition,
+                    hasInstance: generateFlags.hasInstance
+                )
+            )
         }
         return decls
     }
-    
+
     public static func expansion(
         of node: AttributeSyntax,
         attachedTo declaration: some DeclGroupSyntax,
@@ -181,37 +204,30 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         in context: some MacroExpansionContext
     ) throws -> [AttributeSyntax] {
         guard member.is(InitializerDeclSyntax.self) else { return [] }
-        let baseName = declaration.as(
-            StructDeclSyntax.self
-        )?.name.text ?? "Type"
+        let baseName = declaration.as(StructDeclSyntax.self)?.name.text ?? "Type"
         let attr: AttributeSyntax = "@available(*, unavailable, message: \"Do not instantiate \(raw: baseName) directly. Use nested types instead.\")"
         return [attr]
     }
-    
-    // MARK: - Generation
+
+    // MARK: - Generation helpers
+
     private static func createBlockingUnavailableInit(baseName: String, properties: [VariableDeclSyntax]) -> DeclSyntax {
         let params = properties.compactMap { p -> String? in
             guard let b = p.bindings.first,
-                  let n = b.pattern.as(
-                    IdentifierPatternSyntax.self
-                  )?.identifier.text,
-                  let t = b.typeAnnotation?.type.description.trimmingCharacters(
-                    in: .whitespacesAndNewlines
-                  )
+                  let n = b.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
+                  let t = b.typeAnnotation?.type.description.trimmingCharacters(in: .whitespacesAndNewlines)
             else { return nil }
             return "\(n): \(t)"
         }.joined(separator: ", ")
-        
+
         return """
         @available(*, unavailable, message: "Do not instantiate '\(raw: baseName)'. Use nested types instead.")
         public init(\(raw: params)) { fatalError("This initializer cannot be called.") }
         """
     }
-    
+
     private static func createDefinitionStruct(properties: [VariableDeclSyntax]) -> DeclSyntax {
-        let props = properties.map { $0.description }.joined(
-            separator: "\n\n    "
-        )
+        let props = properties.map { $0.description }.joined(separator: "\n\n    ")
         return """
         public struct Definition: Identifiable, Codable, Hashable {
             public var id: UUID = UUID()
@@ -219,116 +235,229 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         }
         """
     }
-    
+
     private static func createInstanceStruct(properties: [VariableDeclSyntax]) -> DeclSyntax {
-        let props = properties.map { $0.description }.joined(
-            separator: "\n\n    "
-        )
+        let props = properties.map { $0.description }.joined(separator: "\n\n    ")
+
+        let updates = properties.compactMap { p -> String? in
+            guard let b = p.bindings.first,
+                  let name = b.pattern.as(IdentifierPatternSyntax.self)?.identifier.text
+            else { return nil }
+            return "self.\(name) = resolved.\(name)"
+        }.joined(separator: "\n        ")
+
         return """
-        public struct Instance: Identifiable, Codable, Hashable {
+        public struct Instance: Identifiable, Codable, Hashable, UpdatableFromResolved {
             public var id: UUID = UUID()
             \(raw: props)
+
+            public typealias ResolvedType = Resolved
+
+            public mutating func update(from resolved: Resolved) {
+                \(raw: updates)
+            }
         }
         """
     }
-    
-    private static func createOverrideStruct(fullOverrides: [VariableDeclSyntax], nestedOverrides: [String: [(leafName: String, leafType: String)]], includeFields: Bool) -> DeclSyntax {
+
+    private static func createOverrideStruct(
+        baseName: String,
+        fullOverrides: [VariableDeclSyntax],
+        nestedOverrides: [String: [(leafName: String, leafType: String)]],
+        includeFields: Bool
+    ) -> DeclSyntax {
         var fields: [String] = []
         if includeFields {
             for p in fullOverrides {
                 guard let b = p.bindings.first,
-                      let n = b.pattern.as(
-                        IdentifierPatternSyntax.self
-                      )?.identifier.text,
-                      let t = b.typeAnnotation?.type.description.trimmingCharacters(
-                        in: .whitespacesAndNewlines
-                      )
+                      let n = b.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
+                      let t = b.typeAnnotation?.type.description.trimmingCharacters(in: .whitespacesAndNewlines)
                 else { continue }
                 fields.append("public var \(n): \(t)?")
             }
-            for (parent, nested) in nestedOverrides
-                .sorted(by: { $0.key < $1.key }) {
+            for (parent, nested) in nestedOverrides.sorted(by: { $0.key < $1.key }) {
                 for leaf in nested {
-                    fields
-                        .append(
-                            "public var \(parent)_\(leaf.leafName): \(leaf.leafType)?"
-                        )
+                    fields.append("public var \(parent)_\(leaf.leafName): \(leaf.leafType)?")
                 }
             }
         }
-        let fieldsBlock = fields.isEmpty ? "" : "\n    " + fields.joined(
-            separator: "\n    "
-        )
+        let fieldsBlock = fields.isEmpty ? "" : "\n    " + fields.joined(separator: "\n    ")
+
         let params = fields.map { line in
             (line.replacingOccurrences(of: "public var ", with: "")) + " = nil"
         }
-        let paramsBlock = params.isEmpty ? "" : ",\n        " + params.joined(
-            separator: ",\n        "
-        )
+        let paramsBlock = params.isEmpty ? "" : ",\n        " + params.joined(separator: ",\n        ")
+
         let assigns = fields.map { line in
-            let name = line.replacingOccurrences(of: "public var ", with: "").split(separator: ":")[0].trimmingCharacters(
-                in: .whitespaces
-            )
+            let name = line
+                .replacingOccurrences(of: "public var ", with: "")
+                .split(separator: ":")[0]
+                .trimmingCharacters(in: .whitespaces)
             return "self.\(name) = \(name)"
         }
-        let assignsBlock = assigns.isEmpty ? "" : "\n        " + assigns.joined(
-            separator: "\n        "
-        )
+        let assignsBlock = assigns.isEmpty ? "" : "\n        " + assigns.joined(separator: "\n        ")
+
+        let updateLinesFull = fullOverrides.compactMap { p -> String? in
+            guard let b = p.bindings.first,
+                  let n = b.pattern.as(IdentifierPatternSyntax.self)?.identifier.text
+            else { return nil }
+            return "self.\(n) = resolved.\(n)"
+        }
+
+        let updateLinesNested = nestedOverrides.flatMap { parent, nested in
+            nested.map { leaf in
+                "self.\(parent)_\(leaf.leafName) = resolved.\(parent).\(leaf.leafName)"
+            }
+        }
+
+        let updateBody = (updateLinesFull + updateLinesNested).joined(separator: "\n            ")
+
+        let initFromArgsFull = fullOverrides.compactMap { p -> String? in
+            guard let b = p.bindings.first,
+                  let n = b.pattern.as(IdentifierPatternSyntax.self)?.identifier.text
+            else { return nil }
+            return "\(n): resolved.\(n)"
+        }
+
+        let initFromArgsNested = nestedOverrides.flatMap { parent, nested in
+            nested.map { leaf in
+                "\(parent)_\(leaf.leafName): resolved.\(parent).\(leaf.leafName)"
+            }
+        }
+
+        let initFromArgsList = (initFromArgsFull + initFromArgsNested).joined(separator: ",\n            ")
+        let initFromArgsBlock = initFromArgsList.isEmpty ? "" : ",\n            " + initFromArgsList
+
         return """
-        public struct Override: Identifiable, Codable, Hashable {
+        public struct Override: Identifiable, Codable, Hashable, OverrideProtocol, UpdatableFromResolved, CreatableFromResolved {
             public let definitionID: UUID
             public var id: UUID { definitionID }\(raw: fieldsBlock)
+
             public init(definitionID: UUID\(raw: paramsBlock)) {
                 self.definitionID = definitionID\(raw: assignsBlock)
+            }
+
+            public typealias ResolvedType = Resolved
+
+            // Update only the fields declared overridable.
+            public mutating func update(from resolved: Resolved) {
+                \(raw: updateBody)
+            }
+
+            // Create an override from a definition-backed Resolved.
+            public init(from resolved: Resolved) {
+                switch resolved.source {
+                case .definition(let d):
+                    self.init(
+                        definitionID: d.id\(raw: initFromArgsBlock)
+                    )
+                case .instance:
+                    preconditionFailure("Cannot create an Override from an instance-based Resolved")
+                }
             }
         }
         """
     }
-    
+
     private static func createSourceEnum(hasDefinition: Bool, hasInstance: Bool) -> DeclSyntax {
         var cases: [String] = []
         if hasDefinition {
             cases.append("case definition(definition: Definition)")
         }
-        if hasInstance { cases.append("case instance(instance: Instance)") }
+        if hasInstance {
+            cases.append("case instance(instance: Instance)")
+        }
         return """
         public enum Source: Hashable {
             \(raw: cases.joined(separator: "\n    "))
         }
         """
     }
-    
-    private static func createResolvedStruct(properties: [VariableDeclSyntax], hasDefinition: Bool, hasInstance: Bool) -> DeclSyntax {
-        let props = properties.map { $0.description }.joined(
-            separator: "\n\n    "
-        )
+
+    private static func createResolvedStruct(
+        baseName: String,
+        properties: [VariableDeclSyntax],
+        hasDefinition: Bool,
+        hasInstance: Bool
+    ) -> DeclSyntax {
+        let props = properties.map { $0.description }.joined(separator: "\n\n    ")
         let idBody: String = {
             switch (hasDefinition, hasInstance) {
-            case (
-                true,
-                true
-            ): return "switch source { case .definition(let d): return d.id; case .instance(let i): return i.id }"
-            case (
-                true,
-                false
-            ): return "if case let .definition(d) = source { return d.id }; fatalError(\"Invalid source\")"
-            case (
-                false,
-                true
-            ): return "if case let .instance(i) = source { return i.id }; fatalError(\"Invalid source\")"
-            default: return "fatalError(\"No sources available\")"
+            case (true, true):
+                return "switch source { case .definition(let d): return d.id; case .instance(let i): return i.id }"
+            case (true, false):
+                return "if case let .definition(d) = source { return d.id }; fatalError(\"Invalid source\")"
+            case (false, true):
+                return "if case let .instance(i) = source { return i.id }; fatalError(\"Invalid source\")"
+            default:
+                return "fatalError(\"No sources available\")"
             }
         }()
+
+        let header: String = hasInstance
+        ? "public struct Resolved: Identifiable, ResolvedProtocol {"
+        : "public struct Resolved: Identifiable {"
+
+        // Typealiases for protocol associated types
+        let typealiases: String = hasInstance ? """
+            // Bind ResolvedProtocol associated types to enclosing nested types
+            public typealias Source = \(baseName).Source
+            public typealias Override = \(baseName).Override
+            public typealias Instance = \(baseName).Instance
+        """ : """
+            public typealias Source = \(baseName).Source
+        """
+
+        // Only generate apply/remove when we have instances (i.e. full pattern).
+        let applyRemove: String = hasInstance ? """
+            public func apply(toOverrides: inout [Override], andInstances: inout [Instance]) {
+                switch source {
+                case .definition(let d):
+                    // Upsert override using Creatable/Updatable contracts
+                    let newOverride = Override(from: self)
+                    if let idx = toOverrides.firstIndex(where: { $0.definitionID == d.id }) {
+                        toOverrides[idx].update(from: self)
+                    } else {
+                        toOverrides.append(newOverride)
+                    }
+                case .instance(let i):
+                    if let idx = andInstances.firstIndex(where: { $0.id == i.id }) {
+                        andInstances[idx].update(from: self)
+                    } else {
+                        // No CreatableFromResolved for Instance by design; skip creation.
+                    }
+                }
+            }
+
+            public func remove(fromOverrides: inout [Override], andInstances: inout [Instance]) {
+                switch source {
+                case .definition(let d):
+                    if let idx = fromOverrides.firstIndex(where: { $0.definitionID == d.id }) {
+                        fromOverrides.remove(at: idx)
+                    }
+                case .instance(let i):
+                    if let idx = andInstances.firstIndex(where: { $0.id == i.id }) {
+                        andInstances.remove(at: idx)
+                    }
+                }
+            }
+        """ : ""
+
         return """
-        public struct Resolved: Identifiable {
+        \(raw: header)
+            \(raw: typealiases)
+
             public let source: Source
             public var id: UUID { \(raw: idBody) }
             \(raw: props)
+
+            \(raw: applyRemove)
         }
         """
     }
-    
+
     private static func createResolverStruct(
+        baseName: String,
         allProperties: [VariableDeclSyntax],
         fullOverrides: [VariableDeclSyntax],
         nestedOverrides: [String: [(leafName: String, leafType: String)]],
@@ -337,11 +466,8 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
     ) -> DeclSyntax {
 
         let fullOverrideSet = Set(
-            fullOverrides
-                .compactMap { $0.bindings.first?.pattern.as(
-                    IdentifierPatternSyntax.self
-                )?.identifier.text
-                })
+            fullOverrides.compactMap { $0.bindings.first?.pattern.as(IdentifierPatternSyntax.self)?.identifier.text }
+        )
         let nestedOverrideSet = Set(nestedOverrides.keys)
 
         let resolvedFromDefArgs = allProperties.map { p -> String in
@@ -421,7 +547,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
     }
     """ : ""
 
-        // Combined entry point ONLY when both kinds exist
+        // Combined entry point (required by ResolverProtocol), only when both kinds exist
         let mainResolver: String = {
             guard hasDefinition && hasInstance else { return "" }
             return """
@@ -438,8 +564,22 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         """
         }()
 
+        // Protocol conformance header and associated typealiases (only valid in .full)
+        let header: String = hasDefinition && hasInstance
+        ? "public struct Resolver: ResolverProtocol {"
+        : "public struct Resolver {"
+
+        let typealiasesBlock: String = hasDefinition && hasInstance ? """
+        // Bind ResolverProtocol associated types
+        public typealias Definition = \(baseName).Definition
+        public typealias Instance   = \(baseName).Instance
+        public typealias Override   = \(baseName).Override
+        public typealias Resolved   = \(baseName).Resolved
+        """ : ""
+
         // Assemble sections conditionally
         var sections: [String] = []
+        if !typealiasesBlock.isEmpty { sections.append(typealiasesBlock) }
         if !helperFromDef.isEmpty { sections.append(helperFromDef) }
         if !helperFromInst.isEmpty { sections.append(helperFromInst) }
         if !scalarFromDef.isEmpty { sections.append(scalarFromDef) }
@@ -449,31 +589,25 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro {
         if !mainResolver.isEmpty { sections.append(mainResolver) }
 
         return """
-    public struct Resolver {
-        \(raw: sections.joined(separator: "\n\n    "))
+    \(raw: header)
+        \(raw: sections.joined(separator: "\n\n        "))
     }
     """
     }
-    
+
     // MARK: - Helper Functions
     private static func parsePattern(from node: AttributeSyntax) -> ResolvablePattern {
         guard let args = node.arguments?.as(LabeledExprListSyntax.self),
-              let patternArg = args.first(
-                where: { $0.label?.text == "pattern"
-                })
+              let patternArg = args.first(where: { $0.label?.text == "pattern" })
         else { return .full }
-        if patternArg.expression.description
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .contains("nonInstantiable") {
+        if patternArg.expression.description.trimmingCharacters(in: .whitespacesAndNewlines).contains("nonInstantiable") {
             return .nonInstantiable
         }
         return .full
     }
-    
+
     private static func extractTypeName(from expr: ExprSyntax) -> String? {
-        let text = expr.description.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
+        let text = expr.description.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasSuffix(".self") { return String(text.dropLast(5)) }
         return text
     }
@@ -485,17 +619,16 @@ private func diagnoseError(_ context: some MacroExpansionContext,
                            node: Syntax,
                            id: String,
                            message: String) {
-    context
-        .diagnose(
-            Diagnostic(
-                node: node,
-                message: ResolvableMessage(
-                    id: id,
-                    message: message,
-                    severity: .error
-                )
+    context.diagnose(
+        Diagnostic(
+            node: node,
+            message: ResolvableMessage(
+                id: id,
+                message: message,
+                severity: .error
             )
         )
+    )
 }
 
 // MARK: - Diagnostics & Plugin Boilerplate
@@ -515,14 +648,18 @@ private struct ResolvableMessage: DiagnosticMessage {
     }
 }
 
-@main
-struct ResolvableMacroPlugin: CompilerPlugin {
-    let providingMacros: [Macro.Type] = [ResolvableMacro.self]
-}
+ @main
+ struct ResolvableMacroPlugin: CompilerPlugin {
+     let providingMacros: [Macro.Type] = [
+         ResolvableMacro.self,
+         ResolvableDestinationMacro.self
+     ]
+ }
 
 extension KeyPathExprSyntax {
     var lastComponentName: String? {
         self.components.last?.component
-            .as(KeyPathPropertyComponentSyntax.self)?.declName.baseName.text
+            .as(KeyPathPropertyComponentSyntax.self)?
+            .declName.baseName.text
     }
 }
