@@ -1,3 +1,4 @@
+import Foundation
 import SwiftCompilerPlugin
 import SwiftSyntax
 import SwiftSyntaxBuilder
@@ -87,7 +88,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro, ExtensionMacro
         var defaultBehavior: ResolvableDefault = .identity
         if let args = node.arguments?.as(LabeledExprListSyntax.self),
            let defaultArg = args.first(where: { $0.label?.text == "default" }) {
-            let text = defaultArg.expression.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            let text = defaultArg.expression.description.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             if text.contains("overridable") { defaultBehavior = .overridable }
         }
 
@@ -104,13 +105,13 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro, ExtensionMacro
             let overridableAttr = varDecl.attributes.first {
                 $0.as(AttributeSyntax.self)?
                     .attributeName.description
-                    .trimmingCharacters(in: .whitespacesAndNewlines) == "Overridable"
+                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) == "Overridable"
             }?.as(AttributeSyntax.self)
 
             let hasIdentity = varDecl.attributes.contains {
                 $0.as(AttributeSyntax.self)?
                     .attributeName.description
-                    .trimmingCharacters(in: .whitespacesAndNewlines) == "Identity"
+                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) == "Identity"
             }
             let hasOverridable = (overridableAttr != nil)
 
@@ -215,7 +216,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro, ExtensionMacro
         let params = properties.compactMap { p -> String? in
             guard let b = p.bindings.first,
                   let n = b.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
-                  let t = b.typeAnnotation?.type.description.trimmingCharacters(in: .whitespacesAndNewlines)
+                  let t = b.typeAnnotation?.type.description.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             else { return nil }
             return "\(n): \(t)"
         }.joined(separator: ", ")
@@ -271,7 +272,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro, ExtensionMacro
             for p in fullOverrides {
                 guard let b = p.bindings.first,
                       let n = b.pattern.as(IdentifierPatternSyntax.self)?.identifier.text,
-                      let t = b.typeAnnotation?.type.description.trimmingCharacters(in: .whitespacesAndNewlines)
+                      let t = b.typeAnnotation?.type.description.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
                 else { continue }
                 fields.append("public var \(n): \(t)?")
             }
@@ -292,7 +293,7 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro, ExtensionMacro
             let name = line
                 .replacingOccurrences(of: "public var ", with: "")
                 .split(separator: ":")[0]
-                .trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             return "self.\(name) = \(name)"
         }
         let assignsBlock = assigns.isEmpty ? "" : "\n        " + assigns.joined(separator: "\n        ")
@@ -413,11 +414,12 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro, ExtensionMacro
             public func apply(toOverrides: inout [Override], andInstances: inout [Instance]) {
                 switch source {
                 case .definition(let d):
-                    // Upsert override using Creatable/Updatable contracts
-                    let newOverride = Override(from: self)
                     if let idx = toOverrides.firstIndex(where: { $0.definitionID == d.id }) {
+                        // Found an existing override; update it in place.
                         toOverrides[idx].update(from: self)
                     } else {
+                        // Create a new override only when needed.
+                        let newOverride = Override(from: self)
                         toOverrides.append(newOverride)
                     }
                 case .instance(let i):
@@ -600,14 +602,14 @@ public struct ResolvableMacro: MemberMacro, MemberAttributeMacro, ExtensionMacro
         guard let args = node.arguments?.as(LabeledExprListSyntax.self),
               let patternArg = args.first(where: { $0.label?.text == "pattern" })
         else { return .full }
-        if patternArg.expression.description.trimmingCharacters(in: .whitespacesAndNewlines).contains("nonInstantiable") {
+        if patternArg.expression.description.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).contains("nonInstantiable") {
             return .nonInstantiable
         }
         return .full
     }
 
     private static func extractTypeName(from expr: ExprSyntax) -> String? {
-        let text = expr.description.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = expr.description.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         if text.hasSuffix(".self") { return String(text.dropLast(5)) }
         return text
     }
@@ -648,14 +650,14 @@ private struct ResolvableMessage: DiagnosticMessage {
     }
 }
 
- @main
- struct ResolvableMacroPlugin: CompilerPlugin {
-     let providingMacros: [Macro.Type] = [
-         ResolvableMacro.self,
-         ResolvableDestinationMacro.self,
-         DefinitionSourceMacro.self
-     ]
- }
+@main
+struct ResolvableMacroPlugin: CompilerPlugin {
+    let providingMacros: [Macro.Type] = [
+        ResolvableMacro.self,
+        ResolvableDestinationMacro.self,
+        DefinitionSourceMacro.self
+    ]
+}
 
 extension KeyPathExprSyntax {
     var lastComponentName: String? {
