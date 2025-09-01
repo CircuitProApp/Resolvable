@@ -652,7 +652,8 @@ private struct ResolvableMessage: DiagnosticMessage {
  struct ResolvableMacroPlugin: CompilerPlugin {
      let providingMacros: [Macro.Type] = [
          ResolvableMacro.self,
-         ResolvableDestinationMacro.self
+         ResolvableDestinationMacro.self,
+         DefinitionSourceMacro.self
      ]
  }
 
